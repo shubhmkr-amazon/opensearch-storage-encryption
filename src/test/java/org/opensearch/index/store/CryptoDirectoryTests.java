@@ -1,21 +1,11 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
-
 package org.opensearch.index.store;
 
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSLockFactory;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
-import org.apache.lucene.tests.mockfile.ExtrasFS;
-import org.opensearch.common.Randomness;
-import org.opensearch.common.crypto.DataKeyPair;
-import org.opensearch.common.crypto.MasterKeyProvider;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -27,8 +17,14 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSLockFactory;
+import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.tests.mockfile.ExtrasFS;
+import org.opensearch.common.Randomness;
+import org.opensearch.common.crypto.DataKeyPair;
+import org.opensearch.common.crypto.MasterKeyProvider;
 
 /**
  * SMB Tests using NIO FileSystem as index store type.
@@ -68,7 +64,8 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
                 in.close();
             }
 
-            Set<String> files = Arrays.stream(dir.listAll())
+            Set<String> files = Arrays
+                .stream(dir.listAll())
                 .filter(file -> !ExtrasFS.isExtra(file)) // remove any ExtrasFS stuff.
                 .filter(file -> !file.equals(KEY_FILE_NAME)) // remove keyfile.
                 .filter(file -> !file.equals("ivFile")) // remove ivFile.
@@ -90,7 +87,7 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
                 // makes this test really slow
                 ((MockDirectoryWrapper) dir).setThrottling(MockDirectoryWrapper.Throttling.NEVER);
             }
-
+        
             AtomicBoolean stop = new AtomicBoolean();
             Thread writer = new Thread(() -> {
                 try {
@@ -110,7 +107,7 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
                     stop.set(true);
                 }
             });
-
+        
             Thread reader = new Thread(() -> {
                 try {
                     Random rnd = new Random(RandomizedTest.randomLong());
@@ -119,7 +116,7 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
                             .filter(name -> !ExtrasFS.isExtra(name)) // Ignore anything from ExtraFS.
                             .filter(name -> !name.equals(KEY_FILE_NAME)) // remove keyfile.
                             .toArray(String[]::new);
-
+        
                         if (files.length > 0) {
                             do {
                                 String file = RandomPicks.randomFrom(rnd, files);
@@ -141,10 +138,10 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
                     throw new UncheckedIOException(e);
                 }
             });
-
+        
             reader.start();
             writer.start();
-
+        
             writer.join();
             reader.join();
         } */

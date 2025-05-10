@@ -1,18 +1,15 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
 package org.opensearch.index.store;
+
+import static org.mockito.Mockito.mock;
 
 import org.opensearch.common.crypto.CryptoHandler;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.plugins.CryptoPlugin;
 import org.opensearch.plugins.Plugin;
-
-import static org.mockito.Mockito.mock;
 
 /**
  * Some tests rely on the keyword tokenizer, but this tokenizer isn't part of lucene-core and therefor not available

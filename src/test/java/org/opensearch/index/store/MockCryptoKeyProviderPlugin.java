@@ -1,11 +1,13 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
 package org.opensearch.index.store;
+
+import static org.mockito.AdditionalAnswers.returnsFirstArg;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.Randomness;
@@ -13,11 +15,6 @@ import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.plugins.CryptoKeyProviderPlugin;
 import org.opensearch.plugins.Plugin;
-
-import static org.mockito.AdditionalAnswers.returnsFirstArg;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * Some tests rely on the keyword tokenizer, but this tokenizer isn't part of lucene-core and therefor not available

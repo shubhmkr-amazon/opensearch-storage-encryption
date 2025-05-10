@@ -1,17 +1,15 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
-
-/*
- * Modifications Copyright OpenSearch Contributors. See
- * GitHub history for details.
- */
-
 package org.opensearch.index.store;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.Provider;
+import java.security.Security;
+import java.util.function.Function;
 
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.LockFactory;
@@ -25,13 +23,6 @@ import org.opensearch.crypto.CryptoHandlerRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.IndexStorePlugin;
-
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.Provider;
-import java.security.Security;
-import java.util.function.Function;
 
 /**
  * Factory for an encrypted filesystem directory
@@ -52,7 +43,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         Provider p = Security.getProvider(s);
         if (p == null) {
             throw new SettingsException("unrecognized [index.store.crypto.provider] \"" + s + "\"");
-        } else return p;
+        } else
+            return p;
     }, Property.IndexScope, Property.InternalIndex);
 
     /**
@@ -70,7 +62,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         CryptoMetadata cryptoMetadata = new CryptoMetadata("", KEY_PROVIDER_TYPE, settings);
         MasterKeyProvider keyProvider;
         try {
-            keyProvider = CryptoHandlerRegistry.getInstance()
+            keyProvider = CryptoHandlerRegistry
+                .getInstance()
                 .getCryptoKeyProviderPlugin(KEY_PROVIDER_TYPE)
                 .createKeyProvider(cryptoMetadata);
         } catch (NullPointerException npe) {

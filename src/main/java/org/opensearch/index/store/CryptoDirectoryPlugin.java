@@ -1,27 +1,16 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
-
-/*
-
-/*
- * Modifications Copyright OpenSearch Contributors. See
- * GitHub history for details.
- */
-
 package org.opensearch.index.store;
-
-import org.opensearch.common.settings.Setting;
-import org.opensearch.plugins.IndexStorePlugin;
-import org.opensearch.plugins.Plugin;
 
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+
+import org.opensearch.common.settings.Setting;
+import org.opensearch.plugins.IndexStorePlugin;
+import org.opensearch.plugins.Plugin;
 
 /**
  * A plugin that enables index level encryption and decryption.

@@ -29,6 +29,7 @@ plugins {
     id 'java'
     id 'idea'
     id 'jacoco'
+    id 'com.diffplug.spotless' version '6.25.0'
 }
 
 apply plugin: 'opensearch.opensearchplugin'
@@ -138,4 +139,13 @@ task allTests {
     dependsOn test, internalClusterTest, yamlRestTest
     group = 'Verification'
     description = 'Runs all tests (Unit, Integration, and YAML)'
+}
+
+spotless {
+    java {
+        removeUnusedImports()
+        importOrder 'java', 'javax', 'org', 'com'
+        licenseHeaderFile 'spotless.license.java'
+        eclipse().configFile rootProject.file('.eclipseformat.xml')
+    }
 }

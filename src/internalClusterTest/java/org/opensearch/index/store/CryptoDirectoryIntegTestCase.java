@@ -1,11 +1,15 @@
 /*
+ * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
- *
- * The OpenSearch Contributors require contributions made to
- * this file be licensed under the Apache-2.0 license or a
- * compatible open source license.
  */
 package org.opensearch.index.store;
+
+import static org.hamcrest.Matchers.is;
+import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS;
+import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
+
+import java.util.Arrays;
+import java.util.Collection;
 
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.search.SearchResponse;
@@ -17,27 +21,17 @@ import org.opensearch.index.reindex.ReindexRequestBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
-import java.util.Arrays;
-import java.util.Collection;
-
-import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS;
-import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
-import static org.hamcrest.Matchers.is;
-
 public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return Arrays.asList(
-            CryptoDirectoryPlugin.class,
-            MockCryptoKeyProviderPlugin.class,
-            MockCryptoPlugin.class,
-            ReindexModulePlugin.class
-        );
+        return Arrays
+            .asList(CryptoDirectoryPlugin.class, MockCryptoKeyProviderPlugin.class, MockCryptoPlugin.class, ReindexModulePlugin.class);
     }
 
     @Override
     public Settings indexSettings() {
-        return Settings.builder()
+        return Settings
+            .builder()
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
             .put("index.store.kms.type", "dummy")
@@ -45,13 +39,14 @@ public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
     }
 
     public void testEmptyStoreTypeSettings() {
-        Settings settings = Settings.builder()
+        Settings settings = Settings
+            .builder()
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
             .put(SETTING_NUMBER_OF_SHARDS, 1)
             .put(SETTING_NUMBER_OF_REPLICAS, 0)
             .build();
-        
+
         boolean exceptionThrown = false;
 
         try {
@@ -64,12 +59,13 @@ public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
             exceptionThrown = true;
             assertTrue("Expected exception type mismatch", e instanceof Exception);
         }
-    
+
         assertTrue("Expected exception was not thrown", exceptionThrown);
     }
-    
+
     public void testUnavailableStoreType() {
-        Settings settings = Settings.builder()
+        Settings settings = Settings
+            .builder()
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
             .put("index.store.kms.type", "unavailable")
