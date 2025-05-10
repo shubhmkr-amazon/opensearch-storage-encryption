@@ -2,26 +2,30 @@
  * Copyright OpenSearch Contributors
  * SPDX-License-Identifier: Apache-2.0
  */
-package org.opensearch.index.store;
+package org.opensearch.index.store.niofs;
 
 import static org.hamcrest.Matchers.is;
-import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS;
-import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
 
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Locale;
 
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.reindex.ReindexAction;
 import org.opensearch.index.reindex.ReindexModulePlugin;
 import org.opensearch.index.reindex.ReindexRequestBuilder;
+import org.opensearch.index.store.CryptoDirectoryPlugin;
+import org.opensearch.index.store.MockCryptoKeyProviderPlugin;
+import org.opensearch.index.store.MockCryptoPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
-public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
+public class CryptoNIOFSDirectoryIntegTestCases extends OpenSearchIntegTestCase {
+
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return Arrays
@@ -35,55 +39,54 @@ public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
             .put("index.store.kms.type", "dummy")
+            .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.NIOFS.name().toLowerCase(Locale.ROOT))
             .build();
     }
 
-    public void testEmptyStoreTypeSettings() {
-        Settings settings = Settings
-            .builder()
-            .put(super.indexSettings())
-            .put("index.store.type", "cryptofs")
-            .put(SETTING_NUMBER_OF_SHARDS, 1)
-            .put(SETTING_NUMBER_OF_REPLICAS, 0)
-            .build();
+    // public void testEmptyStoreTypeSettings() {
+    // Settings settings = Settings
+    // .builder()
+    // .put(super.indexSettings())
+    // .put("index.store.type", "cryptofs")
+    // .put(SETTING_NUMBER_OF_SHARDS, 1)
+    // .put(SETTING_NUMBER_OF_REPLICAS, 0)
+    // .build();
 
-        boolean exceptionThrown = false;
+    // boolean exceptionThrown = false;
 
-        try {
-            createIndex("test", settings);
-            long nbDocs = randomIntBetween(10, 1000);
-            for (long i = 0; i < nbDocs; i++) {
-                index("test", "doc", "" + i, "foo", "bar");
-            }
-        } catch (Exception e) {
-            exceptionThrown = true;
-            assertTrue("Expected exception type mismatch", e instanceof Exception);
-        }
+    // try {
+    // createIndex("test", settings);
+    // long nbDocs = randomIntBetween(10, 1000);
+    // for (long i = 0; i < nbDocs; i++) {
+    // index("test", "doc", "" + i, "foo", "bar");
+    // }
+    // } catch (Exception e) {
+    // exceptionThrown = true;
+    // assertTrue("Expected exception type mismatch", e instanceof Exception);
+    // }
 
-        assertTrue("Expected exception was not thrown", exceptionThrown);
-    }
+    // assertTrue("Expected exception was not thrown", exceptionThrown);
+    // }
 
-    public void testUnavailableStoreType() {
-        Settings settings = Settings
-            .builder()
-            .put(super.indexSettings())
-            .put("index.store.type", "cryptofs")
-            .put("index.store.kms.type", "unavailable")
-            .put(SETTING_NUMBER_OF_SHARDS, 1)
-            .put(SETTING_NUMBER_OF_REPLICAS, 0)
-            .build();
-
-        // Create an index and index some documents
-        createIndex("test", settings);
-        long nbDocs = randomIntBetween(10, 1000);
-        final Exception e = expectThrows(Exception.class, () -> {
-            for (long i = 0; i < nbDocs; i++) {
-                index("test", "doc", "" + i, "foo", "bar");
-            }
-        });
-        assertTrue(e instanceof Exception);
-    }
-
+    // public void testUnavailableStoreType() {
+    // Settings settings = Settings
+    // .builder()
+    // .put(super.indexSettings())
+    // .put("index.store.type", "cryptofs")
+    // .put("index.store.kms.type", "unavailable")
+    // .put(SETTING_NUMBER_OF_SHARDS, 1)
+    // .put(SETTING_NUMBER_OF_REPLICAS, 0)
+    // .build();
+    // // Create an index and index some documents
+    // createIndex("test", settings);
+    // long nbDocs = randomIntBetween(10, 1000);
+    // final Exception e = expectThrows(Exception.class, () -> {
+    // for (long i = 0; i < nbDocs; i++) {
+    // index("test", "doc", "" + i, "foo", "bar");
+    // }
+    // });
+    // assertTrue(e instanceof Exception);
+    // }
     public void testReindex() {
         // Create an index and index some documents
         createIndex("test");

@@ -25,6 +25,7 @@ import org.apache.lucene.tests.mockfile.ExtrasFS;
 import org.opensearch.common.Randomness;
 import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
+import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 
 /**
  * SMB Tests using NIO FileSystem as index store type.
@@ -44,7 +45,7 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
         rnd.nextBytes(encryptedKey);
         DataKeyPair dataKeyPair = new DataKeyPair(rawKey, encryptedKey);
         when(keyProvider.generateDataPair()).thenReturn(dataKeyPair);
-        return new CryptoDirectory(FSLockFactory.getDefault(), file, Security.getProvider("SunJCE"), keyProvider);
+        return new CryptoNIOFSDirectory(FSLockFactory.getDefault(), file, Security.getProvider("SunJCE"), keyProvider);
     }
 
     @Override

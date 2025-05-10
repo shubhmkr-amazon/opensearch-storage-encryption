@@ -20,8 +20,10 @@ import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsException;
 import org.opensearch.crypto.CryptoHandlerRegistry;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.plugins.IndexStorePlugin;
 
 /**
@@ -82,7 +84,54 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         final Path location = path.resolveIndex();
         final LockFactory lockFactory = indexSettings.getValue(org.opensearch.index.store.FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING);
         Files.createDirectories(location);
+        return newFSDirectory(location, lockFactory, indexSettings);
+    }
+
+    /**
+     * @param location
+     * @param lockFactory
+     * @param indexSettings
+     * @return
+     * @throws IOException
+     */
+    protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
-        return new CryptoDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
+        final String storeType = indexSettings
+            .getSettings()
+            .get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.FS.getSettingsKey());
+
+        IndexModule.Type type;
+        if (IndexModule.Type.FS.match(storeType)) {
+            type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
+        } else {
+            type = IndexModule.Type.fromSettingsKey(storeType);
+        }
+
+        // Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
+        switch (type) {
+            case HYBRIDFS -> {
+                // Use Lucene defaults
+                // final FSDirectory primaryDirectory = FSDirectory.open(location, lockFactory);
+                // final Set<String> nioExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_HYBRID_NIO_EXTENSIONS));
+                // if (primaryDirectory instanceof MMapDirectory) {
+                // MMapDirectory mMapDirectory = (MMapDirectory) primaryDirectory;
+                // return new HybridDirectory(lockFactory, setPreload(mMapDirectory, preLoadExtensions), nioExtensions);
+                // } else {
+                // return primaryDirectory;
+                // }
+
+                // placeholder for now.
+                return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
+            }
+            case MMAPFS -> {
+                // return setPreload(new MMapDirectory(location, lockFactory), preLoadExtensions);
+                // placeholder for now.
+                return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
+            }
+            case SIMPLEFS, NIOFS -> {
+                return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
+            }
+            default -> throw new AssertionError("unexpected built-in store type [" + type + "]");
+        }
     }
 }
