@@ -51,18 +51,23 @@ public class CryptoDirectoryIntegTestCase extends OpenSearchIntegTestCase {
             .put(SETTING_NUMBER_OF_SHARDS, 1)
             .put(SETTING_NUMBER_OF_REPLICAS, 0)
             .build();
+        
+        boolean exceptionThrown = false;
 
-        // Create an index and index some documents
-        createIndex("test", settings);
-        long nbDocs = randomIntBetween(10, 1000);
-        final Exception e = expectThrows(Exception.class, () -> {
+        try {
+            createIndex("test", settings);
+            long nbDocs = randomIntBetween(10, 1000);
             for (long i = 0; i < nbDocs; i++) {
                 index("test", "doc", "" + i, "foo", "bar");
             }
-        });
-        assertTrue(e instanceof Exception);
+        } catch (Exception e) {
+            exceptionThrown = true;
+            assertTrue("Expected exception type mismatch", e instanceof Exception);
+        }
+    
+        assertTrue("Expected exception was not thrown", exceptionThrown);
     }
-
+    
     public void testUnavailableStoreType() {
         Settings settings = Settings.builder()
             .put(super.indexSettings())

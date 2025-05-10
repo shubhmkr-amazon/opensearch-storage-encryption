@@ -34,6 +34,7 @@ plugins {
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.yaml-rest-test'
 apply plugin: 'opensearch.internal-cluster-test'
+apply plugin: 'opensearch.java-agent'
 
 ext {
     projectSubstitutions = [:]
@@ -63,6 +64,7 @@ dependencies {
     internalClusterTestImplementation "org.opensearch.plugin:reindex-client:${opensearch_version}"
     internalClusterTestImplementation "org.opensearch.plugin:lang-mustache-client:${opensearch_version}"
     internalClusterTestImplementation "org.opensearch.plugin:parent-join-client:${opensearch_version}"
+    internalClusterTestImplementation "org.opensearch.plugin:crypto-kms:${opensearch_version}"
     internalClusterTestImplementation "org.opensearch.plugin:aggs-matrix-stats-client:${opensearch_version}"
 }
 
@@ -73,6 +75,10 @@ test {
         showStandardStreams = true
     }
     systemProperty 'tests.security.manager', 'false'
+    jvmArgs += [
+        '--enable-preview',
+        '--enable-native-access=ALL-UNNAMED'
+    ]
 }
 
 tasks.named('internalClusterTest').configure {
@@ -82,6 +88,10 @@ tasks.named('internalClusterTest').configure {
         events "passed", "skipped", "failed"
         showStandardStreams = true
     }
+    jvmArgs += [
+        '--enable-preview',
+        '--enable-native-access=ALL-UNNAMED'
+    ]
 }
 
 compileJava {
@@ -109,7 +119,7 @@ javadoc {
 }
 
 jacoco {
-    toolVersion = "0.8.7"
+    toolVersion = "0.8.12"
 }
 
 jacocoTestReport {
