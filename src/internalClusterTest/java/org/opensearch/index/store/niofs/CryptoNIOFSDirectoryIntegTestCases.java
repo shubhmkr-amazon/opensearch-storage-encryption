@@ -8,12 +8,10 @@ import static org.hamcrest.Matchers.is;
 
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Locale;
 
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.reindex.ReindexAction;
 import org.opensearch.index.reindex.ReindexModulePlugin;
@@ -39,7 +37,6 @@ public class CryptoNIOFSDirectoryIntegTestCases extends OpenSearchIntegTestCase 
             .put(super.indexSettings())
             .put("index.store.type", "cryptofs")
             .put("index.store.kms.type", "dummy")
-            .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.NIOFS.name().toLowerCase(Locale.ROOT))
             .build();
     }
 

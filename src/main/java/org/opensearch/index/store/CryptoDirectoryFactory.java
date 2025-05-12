@@ -96,16 +96,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
-        final String storeType = indexSettings
-            .getSettings()
-            .get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), IndexModule.Type.FS.getSettingsKey());
 
-        IndexModule.Type type;
-        if (IndexModule.Type.FS.match(storeType)) {
-            type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
-        } else {
-            type = IndexModule.Type.fromSettingsKey(storeType);
-        }
+        // todo pick type from index settings.
+        IndexModule.Type type = IndexModule.Type.NIOFS;
 
         // Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
         switch (type) {
