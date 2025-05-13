@@ -9,6 +9,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
 import java.security.Security;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
@@ -25,6 +27,7 @@ import org.opensearch.crypto.CryptoHandlerRegistry;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
+import org.opensearch.index.store.mmap.CryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.plugins.IndexStorePlugin;
 
@@ -102,31 +105,18 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
 
-        // todo pick type from index settings.
-        IndexModule.Type type = IndexModule.Type.NIOFS;
+        IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
 
-        // Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
+        Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
         switch (type) {
-            case HYBRIDFS -> {
-                // Use Lucene defaults
-                // final FSDirectory primaryDirectory = FSDirectory.open(location, lockFactory);
-                // final Set<String> nioExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_HYBRID_NIO_EXTENSIONS));
-                // if (primaryDirectory instanceof MMapDirectory) {
-                // MMapDirectory mMapDirectory = (MMapDirectory) primaryDirectory;
-                // return new HybridDirectory(lockFactory, setPreload(mMapDirectory, preLoadExtensions), nioExtensions);
-                // } else {
-                // return primaryDirectory;
-                // }
-
-                // placeholder for now.
-                return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
-            }
             case MMAPFS -> {
-                // return setPreload(new MMapDirectory(location, lockFactory), preLoadExtensions);
-                // placeholder for now.
-                return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
+                LOGGER.info("Using MMAPFS directory");
+
+                CryptoMMapDirectory cryptoMMapDir = new CryptoMMapDirectory(location, provider, getKeyProvider(indexSettings));
+                cryptoMMapDir.setPreloadExtensions(preLoadExtensions);
+                return cryptoMMapDir;
             }
-            case SIMPLEFS, NIOFS -> {
+            case SIMPLEFS, NIOFS, HYBRIDFS -> {
                 LOGGER.info("Using NIOFS directory");
                 return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
             }

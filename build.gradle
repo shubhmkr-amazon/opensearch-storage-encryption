@@ -98,20 +98,39 @@ tasks.named('internalClusterTest').configure {
     ]
 }
 
+tasks.named("yamlRestTest").configure {
+    systemProperty 'tests.security.manager', 'false'
+    systemProperty 'java.security.policy', 'test.policy'
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+    jvmArgs += "--enable-preview"
+    jvmArgs += "--enable-native-access=ALL-UNNAMED"
+}
+
 compileJava {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
     options.encoding = 'UTF-8'
     options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation' << '-Werror'
+    options.compilerArgs += ['--enable-preview']
 }
 
 compileTestJava {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
+    options.compilerArgs += ['--enable-preview']
 }
 
-tasks.withType(JavaCompile) {
+tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+    options.compilerArgs += "--enable-preview"
+    options.release = 21
+}
+
+tasks.withType(Test).configureEach {
+    jvmArgs += "--enable-preview"
 }
 
 javadoc {
@@ -119,6 +138,8 @@ javadoc {
     options.charSet = 'UTF-8'
     options.addStringOption('Xdoclint:all', '-quiet')
     options.addStringOption('tag', 'opensearch.internal:a:Internal:')
+    options.addStringOption("source", "21")
+    options.addBooleanOption("-enable-preview", true)
     failOnError = true
 }
 
