@@ -11,6 +11,8 @@ import java.security.Provider;
 import java.security.Security;
 import java.util.function.Function;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
@@ -30,6 +32,8 @@ import org.opensearch.plugins.IndexStorePlugin;
  * Factory for an encrypted filesystem directory
  */
 public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
+
+    private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
     /**
      * Creates a new CryptoDirectoryFactory
@@ -88,10 +92,11 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }
 
     /**
-     * @param location
-     * @param lockFactory
-     * @param indexSettings
-     * @return
+     * {@inheritDoc}
+     * @param location the directory location
+     * @param lockFactory the lockfactory for this FS directory
+     * @param indexSettings the read index settings 
+     * @return the concrete implementation of the directory based on index setttings.
      * @throws IOException
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
@@ -122,6 +127,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                 return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
             }
             case SIMPLEFS, NIOFS -> {
+                LOGGER.info("Using NIOFS directory");
                 return new CryptoNIOFSDirectory(lockFactory, location, provider, getKeyProvider(indexSettings));
             }
             default -> throw new AssertionError("unexpected built-in store type [" + type + "]");

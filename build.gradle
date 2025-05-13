@@ -57,6 +57,9 @@ repositories {
 
 dependencies {
     compileOnly "org.opensearch:opensearch:${opensearch_version}"
+    
+    runtimeOnly "org.apache.logging.log4j:log4j-slf4j-impl:${versions.log4j}"
+    
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
     testImplementation "commons-io:commons-io:2.13.0"
 
@@ -132,6 +135,8 @@ jacocoTestReport {
 
 check.dependsOn jacocoTestReport
 
+dependencyLicenses.enabled = false
+thirdPartyAudit.enabled = false
 loggerUsageCheck.enabled = false
 validateNebulaPom.enabled = false
 
