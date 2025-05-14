@@ -9,6 +9,7 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.security.Provider;
 import java.security.Security;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,14 +18,15 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import javax.crypto.spec.SecretKeySpec;
+
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSLockFactory;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.tests.mockfile.ExtrasFS;
 import org.opensearch.common.Randomness;
-import org.opensearch.common.crypto.DataKeyPair;
-import org.opensearch.common.crypto.MasterKeyProvider;
+import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 
 /**
@@ -37,15 +39,25 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
 
     @Override
     protected Directory getDirectory(Path file) throws IOException {
-        MasterKeyProvider keyProvider = mock(MasterKeyProvider.class);
-        byte[] rawKey = new byte[32];
-        byte[] encryptedKey = new byte[32];
+        // Create raw AES key
+        byte[] rawKey = new byte[32]; // 256-bit AES key
+        byte[] encryptedKey = new byte[32]; // Not used in test but needed for interface
         java.util.Random rnd = Randomness.get();
         rnd.nextBytes(rawKey);
         rnd.nextBytes(encryptedKey);
-        DataKeyPair dataKeyPair = new DataKeyPair(rawKey, encryptedKey);
-        when(keyProvider.generateDataPair()).thenReturn(dataKeyPair);
-        return new CryptoNIOFSDirectory(FSLockFactory.getDefault(), file, Security.getProvider("SunJCE"), keyProvider);
+
+        // Create mock KeyIvResolver
+        KeyIvResolver keyIvResolver = mock(KeyIvResolver.class);
+        byte[] iv = new byte[16]; // 128-bit IV for AES/CTR
+        rnd.nextBytes(iv);
+
+        when(keyIvResolver.getDataKey()).thenReturn(new SecretKeySpec(rawKey, "AES"));
+        when(keyIvResolver.getIvBytes()).thenReturn(iv);
+
+        Provider provider = Security.getProvider("SunJCE");
+        assertNotNull("Provider should not be null", provider);
+
+        return new CryptoNIOFSDirectory(FSLockFactory.getDefault(), file, provider, keyIvResolver);
     }
 
     @Override

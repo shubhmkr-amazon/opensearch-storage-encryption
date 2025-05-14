@@ -1,7 +1,3 @@
-/*
- * Copyright OpenSearch Contributors
- * SPDX-License-Identifier: Apache-2.0
- */
 package org.opensearch.index.store.mmap;
 
 /*
@@ -13,10 +9,9 @@ package org.opensearch.index.store.mmap;
  */
 
 /*
- * Modifications Copyright OpenSearch Contributors. See
- * GitHub history for details.
- */
-
+* Modifications Copyright OpenSearch Contributors. See
+* GitHub history for details.
+*/
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -26,10 +21,11 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.Provider;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiPredicate;
 
@@ -38,32 +34,62 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
-import org.apache.lucene.util.SuppressForbidden;
-import org.opensearch.common.crypto.MasterKeyProvider;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.cipher.CipherFactory;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
+@SuppressWarnings("preview")
 @SuppressForbidden(reason = "temporary bypass")
 public final class CryptoMMapDirectory extends MMapDirectory {
 
-    private static final Linker LINKER = Linker.nativeLinker();
-    private static final SymbolLookup LIBC = SymbolLookup.libraryLookup("c", Arena.global());
+    private final KeyIvResolver keyIvResolver;
 
+    private static final Linker LINKER = Linker.nativeLinker();
     private static final int PROT_READ = 0x1;
     private static final int PROT_WRITE = 0x2;
     private static final int MAP_PRIVATE = 0x02;
-
     private static final MethodHandle MMAP;
+    private static final SymbolLookup LIBC = loadLibc();
 
-    private final KeyIvResolver keyResolver;
+    private static SymbolLookup loadLibc() {
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("mac")) {
+            return SymbolLookup.libraryLookup("/usr/lib/libSystem.B.dylib", Arena.global());
+        } else if (os.contains("linux")) {
+            try {
+                // Try the 64-bit version first
+                return SymbolLookup.libraryLookup("/lib64/libc.so.6", Arena.global());
+            } catch (Exception e) {
+                try {
+                    // Fall back to the 32-bit version
+                    return SymbolLookup.libraryLookup("/lib/libc.so.6", Arena.global());
+                } catch (Exception e2) {
+                    throw new RuntimeException("Could not load libc from either /lib64/libc.so.6 or /lib/libc.so.6", e2);
+                }
+            }
+        } else {
+            throw new UnsupportedOperationException("Unsupported OS: " + os);
+        }
+    }
 
     static {
         try {
+            // First try to find mmap
+            Optional<MemorySegment> mmapSymbol = LIBC.find("mmap");
+            if (mmapSymbol.isEmpty()) {
+                // If mmap is not found, try mmap64 on some systems
+                mmapSymbol = LIBC.find("mmap64");
+            }
+
+            if (mmapSymbol.isEmpty()) {
+                throw new RuntimeException("Could not find mmap or mmap64 symbol");
+            }
+
             MMAP = LINKER
                 .downcallHandle(
-                    LIBC.find("mmap").orElseThrow(),
+                    mmapSymbol.get(),
                     FunctionDescriptor
                         .of(
                             ValueLayout.ADDRESS,
@@ -80,17 +106,18 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         }
     }
 
-    public CryptoMMapDirectory(Path path, Provider provider, MasterKeyProvider keyProvider) throws IOException {
+    public CryptoMMapDirectory(Path path, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
         super(path);
-        this.keyResolver = new DefaultKeyIvResolver(this, provider, keyProvider);
+        this.keyIvResolver = keyIvResolver;
     }
 
     /**
-    * Sets the preload predicate based on file extension list.
-    *
-    * @param preLoadExtensions extensions to preload (e.g., ["dvd", "tim", "*"])
-    * @throws IOException if preload configuration fails
-    */
+     * Sets the preload predicate based on file extension list.
+     *
+     * @param preLoadExtensions extensions to preload (e.g., ["dvd", "tim",
+     * "*"])
+     * @throws IOException if preload configuration fails
+     */
     public void setPreloadExtensions(Set<String> preLoadExtensions) throws IOException {
         if (!preLoadExtensions.isEmpty()) {
             this.setPreload(createPreloadPredicate(preLoadExtensions));
@@ -111,8 +138,39 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         };
     }
 
-    public static MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, byte[] key, byte[] iv, int chunkSizePower)
-        throws Throwable {
+    @Override
+    public IndexInput openInput(String name, IOContext context) throws IOException {
+        ensureOpen();
+        ensureCanRead(name);
+
+        Path file = getDirectory().resolve(name);
+        long size = Files.size(file);
+        boolean confined = context == IOContext.READONCE;
+        Arena arena = confined ? Arena.ofConfined() : Arena.ofShared();
+
+        try {
+            // Open the file using native open() call
+            int fd = openFile(file.toString());
+            if (fd == -1) {
+                throw new IOException("Failed to open file: " + file);
+            }
+
+            try {
+                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, 20);
+                return MemorySegmentIndexInput
+                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, 20);
+            } finally {
+                // Close the file descriptor
+                closeFile(fd);
+            }
+
+        } catch (Throwable t) {
+            arena.close();
+            throw new IOException("Failed to mmap/decrypt " + file, t);
+        }
+    }
+
+    public MemorySegment[] mmapAndDecrypt(Path path, int fd, long size, Arena arena, int chunkSizePower) throws Throwable {
         final long chunkSize = 1L << chunkSizePower;
         final int numSegments = (int) (size >>> chunkSizePower) + 1;
         MemorySegment[] segments = new MemorySegment[numSegments];
@@ -128,9 +186,15 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             if (addr.address() == 0 || addr.address() == -1) {
                 throw new IOException("mmap failed at offset: " + offset);
             }
-            MemorySegment segment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize);
 
-            decryptSegment(segment, key, iv, offset);
+            // Create a new segment within the provided arena's scope
+            MemorySegment segment = arena.allocate(segmentSize);
+            MemorySegment mappedSegment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize, arena, null);
+
+            // Copy the mapped memory into the arena-scoped segment
+            MemorySegment.copy(mappedSegment, 0, segment, 0, segmentSize);
+
+            decryptSegment(segment, offset);
 
             segments[i] = segment;
             offset += segmentSize;
@@ -139,8 +203,10 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         return segments;
     }
 
-    // TODO: This can be invoked via FFI for zero copy.
-    private static void decryptSegment(MemorySegment segment, byte[] key, byte[] baseIv, long offset) throws Exception {
+    private void decryptSegment(MemorySegment segment, long offset) throws Exception {
+        final byte[] key = this.keyIvResolver.getDataKey().getEncoded();
+        final byte[] baseIv = this.keyIvResolver.getIvBytes();
+
         Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
         SecretKeySpec keySpec = new SecretKeySpec(key, "AES");
         byte[] ivCopy = Arrays.copyOf(baseIv, baseIv.length);
@@ -161,17 +227,44 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         buffer.put(output);
     }
 
-    public static int getFD(FileChannel channel) {
-        try {
-            var fdField = FileChannel.class.getDeclaredField("fd");
-            fdField.setAccessible(true);
-            Object fdObj = fdField.get(channel);
+    private static final MethodHandle OPEN;
+    private static final MethodHandle CLOSE;
 
-            var fdValField = fdObj.getClass().getDeclaredField("fd");
-            fdValField.setAccessible(true);
-            return fdValField.getInt(fdObj);
-        } catch (IllegalAccessException | IllegalArgumentException | NoSuchFieldException | SecurityException e) {
-            throw new RuntimeException("Unable to get file descriptor from FileChannel", e);
+    static {
+        try {
+            OPEN = LINKER
+                .downcallHandle(
+                    LIBC.find("open").orElseThrow(),
+                    FunctionDescriptor
+                        .of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,    // const char *pathname
+                            ValueLayout.JAVA_INT    // int flags
+                        )
+                );
+
+            CLOSE = LINKER
+                .downcallHandle(
+                    LIBC.find("close").orElseThrow(),
+                    FunctionDescriptor
+                        .of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT    // int fd
+                        )
+                );
+        } catch (Throwable e) {
+            throw new RuntimeException("Failed to bind open/close", e);
         }
+    }
+
+    private static int openFile(String path) throws Throwable {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment pathSegment = arena.allocateUtf8String(path);
+            return (int) OPEN.invoke(pathSegment, 0); // O_RDONLY = 0
+        }
+    }
+
+    private static void closeFile(int fd) throws Throwable {
+        CLOSE.invoke(fd);
     }
 }

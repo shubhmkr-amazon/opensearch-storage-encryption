@@ -22,7 +22,7 @@ import org.opensearch.index.store.MockCryptoPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
-public class CryptoNIOFSDirectoryIntegTestCases extends OpenSearchIntegTestCase {
+public class CryptoDirectoryIntegTestCases extends OpenSearchIntegTestCase {
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {

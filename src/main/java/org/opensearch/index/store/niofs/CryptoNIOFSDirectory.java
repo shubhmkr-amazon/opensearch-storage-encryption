@@ -15,16 +15,13 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import javax.crypto.Cipher;
 
-import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.LockFactory;
 import org.apache.lucene.store.NIOFSDirectory;
-import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.store.cipher.CipherFactory;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
@@ -33,18 +30,15 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  *
  * @opensearch.internal
  */
-public final class CryptoNIOFSDirectory extends NIOFSDirectory {
+public class CryptoNIOFSDirectory extends NIOFSDirectory {
     private final Provider provider;
-    private final KeyIvResolver keyResolver;
+    private final KeyIvResolver keyIvResolver;
     private final AtomicLong nextTempFileCounter = new AtomicLong();
 
-    public CryptoNIOFSDirectory(LockFactory lockFactory, Path location, Provider provider, MasterKeyProvider keyProvider)
-        throws IOException {
+    public CryptoNIOFSDirectory(LockFactory lockFactory, Path location, Provider provider, KeyIvResolver keyIvResolver) throws IOException {
         super(location, lockFactory);
         this.provider = provider;
-
-        Directory baseDir = new NIOFSDirectory(location, lockFactory);
-        this.keyResolver = new DefaultKeyIvResolver(baseDir, provider, keyProvider);
+        this.keyIvResolver = keyIvResolver;
     }
 
     @Override
@@ -61,14 +55,14 @@ public final class CryptoNIOFSDirectory extends NIOFSDirectory {
 
         try {
             Cipher cipher = CipherFactory.getCipher(provider);
-            CipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.DECRYPT_MODE, 0);
+            CipherFactory.initCipher(cipher, keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.DECRYPT_MODE, 0);
 
             final IndexInput indexInput = new CryptoBufferedIndexInput(
                 "CryptoBufferedIndexInput(path=\"" + path + "\")",
                 fc,
                 context,
                 cipher,
-                this.keyResolver
+                this.keyIvResolver
             );
             success = true;
             return indexInput;
@@ -90,7 +84,7 @@ public final class CryptoNIOFSDirectory extends NIOFSDirectory {
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
         Cipher cipher = CipherFactory.getCipher(provider);
-        CipherFactory.initCipher(cipher, this.keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
+        CipherFactory.initCipher(cipher, this.keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
 
         return new CryptoOutputStreamIndexOutput(name, path, fos, cipher);
     }
@@ -107,7 +101,7 @@ public final class CryptoNIOFSDirectory extends NIOFSDirectory {
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
         Cipher cipher = CipherFactory.getCipher(provider);
-        CipherFactory.initCipher(cipher, keyResolver.getDataKey(), keyResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
+        CipherFactory.initCipher(cipher, keyIvResolver.getDataKey(), keyIvResolver.getIvBytes(), Cipher.ENCRYPT_MODE, 0);
 
         return new CryptoOutputStreamIndexOutput(name, path, fos, cipher);
     }
