@@ -1,3 +1,7 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
 package org.opensearch.index.store.mmap;
 
 /*
@@ -180,6 +184,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             long remaining = size - offset;
             long segmentSize = Math.min(chunkSize, remaining);
 
+            // Direct mmap call
             MemorySegment addr = (MemorySegment) MMAP
                 .invoke(MemorySegment.NULL, segmentSize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, offset);
 
@@ -187,13 +192,10 @@ public final class CryptoMMapDirectory extends MMapDirectory {
                 throw new IOException("mmap failed at offset: " + offset);
             }
 
-            // Create a new segment within the provided arena's scope
-            MemorySegment segment = arena.allocate(segmentSize);
-            MemorySegment mappedSegment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize, arena, null);
+            // Create segment directly in the arena's scope
+            MemorySegment segment = MemorySegment.ofAddress(addr.address()).reinterpret(segmentSize, arena, null);
 
-            // Copy the mapped memory into the arena-scoped segment
-            MemorySegment.copy(mappedSegment, 0, segment, 0, segmentSize);
-
+            // Decrypt in place
             decryptSegment(segment, offset);
 
             segments[i] = segment;
@@ -219,12 +221,32 @@ public final class CryptoMMapDirectory extends MMapDirectory {
 
         cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(ivCopy));
 
+        // Process the data in smaller chunks to avoid OOM
         ByteBuffer buffer = segment.asByteBuffer();
-        byte[] input = new byte[buffer.remaining()];
-        buffer.get(input);
-        byte[] output = cipher.doFinal(input);
-        buffer.rewind();
-        buffer.put(output);
+        final int CHUNK_SIZE = 4096; // 4KB chunks
+        byte[] chunk = new byte[CHUNK_SIZE];
+
+        int position = 0;
+        while (position < buffer.capacity()) {
+            int size = Math.min(CHUNK_SIZE, buffer.capacity() - position);
+            buffer.position(position);
+            buffer.get(chunk, 0, size);
+
+            byte[] decrypted;
+            if (position + size >= buffer.capacity()) {
+                // Last chunk
+                decrypted = cipher.doFinal(chunk, 0, size);
+            } else {
+                decrypted = cipher.update(chunk, 0, size);
+            }
+
+            if (decrypted != null) {
+                buffer.position(position);
+                buffer.put(decrypted);
+            }
+
+            position += size;
+        }
     }
 
     private static final MethodHandle OPEN;
