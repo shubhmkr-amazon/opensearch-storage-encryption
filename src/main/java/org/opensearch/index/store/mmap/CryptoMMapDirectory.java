@@ -151,6 +151,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
         long size = Files.size(file);
         boolean confined = context == IOContext.READONCE;
         Arena arena = confined ? Arena.ofConfined() : Arena.ofShared();
+        int chunkSizePower = 34;
 
         try {
             // Open the file using native open() call
@@ -160,9 +161,9 @@ public final class CryptoMMapDirectory extends MMapDirectory {
             }
 
             try {
-                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, 20);
+                MemorySegment[] segments = mmapAndDecrypt(file, fd, size, arena, chunkSizePower);
                 return MemorySegmentIndexInput
-                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, 20);
+                    .newInstance("CryptoMemorySegmentIndexInput(path=\"" + file + "\")", arena, segments, size, chunkSizePower);
             } finally {
                 // Close the file descriptor
                 closeFile(fd);
