@@ -392,17 +392,24 @@ public class MemorySegmentIndexInput extends IndexInput implements RandomAccessI
             return;
         }
 
-        // make sure all accesses to this IndexInput instance throw NPE:
-        curSegment = null;
-        Arrays.fill(segments, null);
-
         // the master IndexInput has an Arena and is able
         // to release all resources (unmap segments) - a
         // side effect is that other threads still using clones
         // will throw IllegalStateException
         if (arena != null) {
-            arena.close();
+            while (arena.scope().isAlive()) {
+                try {
+                    arena.close();
+                    break;
+                } catch (@SuppressWarnings("unused") IllegalStateException e) {
+                    Thread.onSpinWait();
+                }
+            }
         }
+
+        // make sure all accesses to this IndexInput instance throw NPE:
+        curSegment = null;
+        Arrays.fill(segments, null);
     }
 
     /** Optimization of MemorySegmentIndexInput for when there is only one segment. */
