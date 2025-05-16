@@ -39,41 +39,67 @@ public final class CryptoOutputStreamIndexOutput extends OutputStreamIndexOutput
     }
 
     private static class EncryptedOutputStream extends FilterOutputStream {
-
         private final Cipher cipher;
+        private final byte[] buffer;
+        private int bufferPosition = 0;
+        private static final int BUFFER_SIZE = 65536; // Increased buffer size (64KB)
 
         EncryptedOutputStream(OutputStream os, Cipher cipher) {
             super(os);
             this.cipher = cipher;
+            this.buffer = new byte[BUFFER_SIZE];
         }
 
         @Override
         public void write(byte[] b, int offset, int length) throws IOException {
+            if (length >= BUFFER_SIZE) {
+                // For large writes, flush any buffered content first
+                flushBuffer();
+
+                // Process large chunks directly
+                processAndWrite(b, offset, length);
+            } else if (bufferPosition + length > BUFFER_SIZE) {
+                // Buffer would overflow, flush first
+                flushBuffer();
+                System.arraycopy(b, offset, buffer, bufferPosition, length);
+                bufferPosition += length;
+            } else {
+                // Add to buffer
+                System.arraycopy(b, offset, buffer, bufferPosition, length);
+                bufferPosition += length;
+            }
+        }
+
+        private void processAndWrite(byte[] data, int offset, int length) throws IOException {
             try {
-                while (length > 0) {
-                    final int chunk = Math.min(length, CHUNK_SIZE);
-                    byte[] res = cipher.update(b, offset, chunk);
-                    if (res != null && res.length > 0) {
-                        out.write(res);
-                    }
-                    offset += chunk;
-                    length -= chunk;
+                byte[] encrypted = cipher.update(data, offset, length);
+                if (encrypted != null && encrypted.length > 0) {
+                    out.write(encrypted);
                 }
             } catch (IllegalStateException e) {
                 throw new IOException("Cipher update failed: " + e.getMessage(), e);
             }
         }
 
+        private void flushBuffer() throws IOException {
+            if (bufferPosition > 0) {
+                processAndWrite(buffer, 0, bufferPosition);
+                bufferPosition = 0;
+            }
+        }
+
         @Override
         public void write(int b) throws IOException {
-            // delegate to write(byte[], int, int) for single-byte handling
-            byte[] oneByte = new byte[] { (byte) b };
-            write(oneByte, 0, 1);
+            if (bufferPosition >= BUFFER_SIZE) {
+                flushBuffer();
+            }
+            buffer[bufferPosition++] = (byte) b;
         }
 
         @Override
         public void close() throws IOException {
             try {
+                flushBuffer();
                 byte[] finalBytes = cipher.doFinal();
                 if (finalBytes != null && finalBytes.length > 0) {
                     out.write(finalBytes);
@@ -83,6 +109,12 @@ public final class CryptoOutputStreamIndexOutput extends OutputStreamIndexOutput
             } finally {
                 super.close();
             }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            flushBuffer();
+            out.flush();
         }
     }
 }

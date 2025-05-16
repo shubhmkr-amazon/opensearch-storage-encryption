@@ -224,7 +224,7 @@ public final class CryptoMMapDirectory extends MMapDirectory {
 
         // Process the data in smaller chunks to avoid OOM
         ByteBuffer buffer = segment.asByteBuffer();
-        final int CHUNK_SIZE = 4096; // 4KB chunks
+        final int CHUNK_SIZE = 8192; // 8KB chunks
         byte[] chunk = new byte[CHUNK_SIZE];
 
         int position = 0;
