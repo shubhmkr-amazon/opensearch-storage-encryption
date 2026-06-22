@@ -258,4 +258,173 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
 
         assertFalse("Data should be encrypted on disk", rawContent.contains("sensitive document data"));
     }
+
+    /**
+     * Regression test for the partial-write corruption (P0).
+     *
+     * <p>{@link FileChannel#write(ByteBuffer, long)} may write fewer bytes than requested under load.
+     * Before the fix, {@code TranslogChunkManager} issued a single unchecked {@code write} and advanced
+     * its position by only the partial count, dropping the tail of an encrypted chunk and permanently
+     * misaligning every later chunk — surfacing during recovery as {@code AEADBadTagException: Tag mismatch!}
+     * (observed ~chunk 35834 deep in a large file). This test forces short writes on every call and asserts
+     * the file still decrypts byte-for-byte across multiple 8KB chunks.
+     */
+    @SuppressForbidden(reason = "Test needs a real FileChannel to wrap with a short-write delegate")
+    public void testPartialWritesDoNotCorruptTranslog() throws IOException {
+        String testTranslogUUID = "test-partial-write-uuid";
+
+        // ~3.5 chunks of data so the partial-write hole would land mid-stream and misalign later chunks.
+        int dataLen = (TranslogChunkManager.GCM_CHUNK_SIZE * 3) + 1234;
+        byte[] testData = new byte[dataLen];
+        random().nextBytes(testData);
+
+        Path translogPath = tempDir.resolve("test-partial-write.tlog");
+
+        int headerSize;
+        // Open the real channel, then wrap the delegate so every write() reports only a few bytes written.
+        try (FileChannel realChannel = FileChannel.open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            FileChannel shortWriteChannel = new ShortWriteFileChannel(realChannel, 7);
+            try (
+                CryptoFileChannelWrapper cryptoChannel = new CryptoFileChannelWrapper(
+                    shortWriteChannel,
+                    keyResolver,
+                    translogPath,
+                    java.util.Set.of(StandardOpenOption.WRITE),
+                    testTranslogUUID
+                )
+            ) {
+                TranslogHeader header = new TranslogHeader(testTranslogUUID, 1L);
+                header.write(cryptoChannel, false);
+                headerSize = header.sizeInBytes();
+
+                int written = cryptoChannel.write(ByteBuffer.wrap(testData), headerSize);
+                assertEquals("writeToChunks must report all logical bytes despite short delegate writes", dataLen, written);
+            }
+        }
+
+        // Read back through a normal crypto channel (no short writes) and verify exact decryption.
+        CryptoChannelFactory channelFactory = new CryptoChannelFactory(keyResolver, testTranslogUUID);
+        try (FileChannel readChannel = channelFactory.open(translogPath, StandardOpenOption.READ)) {
+            ByteBuffer readBuffer = ByteBuffer.allocate(dataLen);
+            int pos = headerSize;
+            while (readBuffer.hasRemaining()) {
+                int n = readChannel.read(readBuffer, pos);
+                if (n <= 0) {
+                    break;
+                }
+                pos += n;
+            }
+            assertEquals("Should decrypt all bytes back", dataLen, readBuffer.position());
+            assertArrayEquals("Decrypted data must match original despite partial writes", testData, readBuffer.array());
+        }
+    }
+
+    /**
+     * A FileChannel decorator whose positional write() always reports at most {@code maxBytesPerWrite}
+     * bytes written, simulating the OS partial-write behavior that caused the P0 corruption.
+     */
+    @SuppressForbidden(reason = "Test helper wrapping FileChannel to simulate partial writes")
+    private static final class ShortWriteFileChannel extends FileChannel {
+        private final FileChannel delegate;
+        private final int maxBytesPerWrite;
+
+        ShortWriteFileChannel(FileChannel delegate, int maxBytesPerWrite) {
+            this.delegate = delegate;
+            this.maxBytesPerWrite = maxBytesPerWrite;
+        }
+
+        @Override
+        public int write(ByteBuffer src, long position) throws IOException {
+            if (src.remaining() <= maxBytesPerWrite) {
+                return delegate.write(src, position);
+            }
+            int oldLimit = src.limit();
+            src.limit(src.position() + maxBytesPerWrite);
+            int n = delegate.write(src, position);
+            src.limit(oldLimit);
+            return n;
+        }
+
+        @Override
+        public int read(ByteBuffer dst, long position) throws IOException {
+            return delegate.read(dst, position);
+        }
+
+        @Override
+        public long size() throws IOException {
+            return delegate.size();
+        }
+
+        @Override
+        public int read(ByteBuffer dst) throws IOException {
+            return delegate.read(dst);
+        }
+
+        @Override
+        public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+            return delegate.read(dsts, offset, length);
+        }
+
+        @Override
+        public int write(ByteBuffer src) throws IOException {
+            return write(src, position());
+        }
+
+        @Override
+        public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+            return delegate.write(srcs, offset, length);
+        }
+
+        @Override
+        public long position() throws IOException {
+            return delegate.position();
+        }
+
+        @Override
+        public FileChannel position(long newPosition) throws IOException {
+            delegate.position(newPosition);
+            return this;
+        }
+
+        @Override
+        public FileChannel truncate(long newSize) throws IOException {
+            delegate.truncate(newSize);
+            return this;
+        }
+
+        @Override
+        public void force(boolean metaData) throws IOException {
+            delegate.force(metaData);
+        }
+
+        @Override
+        public long transferTo(long position, long count, java.nio.channels.WritableByteChannel target) throws IOException {
+            return delegate.transferTo(position, count, target);
+        }
+
+        @Override
+        public long transferFrom(java.nio.channels.ReadableByteChannel src, long position, long count) throws IOException {
+            return delegate.transferFrom(src, position, count);
+        }
+
+        @Override
+        public java.nio.MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
+            return delegate.map(mode, position, size);
+        }
+
+        @Override
+        public java.nio.channels.FileLock lock(long position, long size, boolean shared) throws IOException {
+            return delegate.lock(position, size, shared);
+        }
+
+        @Override
+        public java.nio.channels.FileLock tryLock(long position, long size, boolean shared) throws IOException {
+            return delegate.tryLock(position, size, shared);
+        }
+
+        @Override
+        protected void implCloseChannel() throws IOException {
+            delegate.close();
+        }
+    }
 }

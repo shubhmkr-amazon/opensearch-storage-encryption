@@ -266,7 +266,7 @@ public class TranslogChunkManager {
             // Write to disk at chunk position
             long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
             ByteBuffer buffer = ByteBuffer.wrap(encryptedWithTag);
-            delegate.write(buffer, diskPosition);
+            writeFully(buffer, diskPosition);
 
         } catch (IOException | AesGcmCipherFactory.JavaCryptoException e) {
             throw new IOException("Failed to encrypt chunk " + chunkIndex + " in file " + filePath, e);
@@ -289,9 +289,9 @@ public class TranslogChunkManager {
 
         int headerSize = determineHeaderSize();
 
-        // Header reads remain unchanged
+        // Header reads: read fully (guard against partial reads being mistaken for EOF)
         if (position < headerSize) {
-            return delegate.read(dst, position);
+            return readFully(dst, position);
         }
 
         // Chunk-based reading for encrypted data
@@ -327,9 +327,9 @@ public class TranslogChunkManager {
 
         int headerSize = determineHeaderSize();
 
-        // Header writes remain unchanged
+        // Header writes: write fully (partial writes here also corrupt the file)
         if (position < headerSize) {
-            return delegate.write(src, position);
+            return writeFully(src, position);
         }
 
         if (fileWritePosition == 0) {
@@ -367,7 +367,7 @@ public class TranslogChunkManager {
             }
 
             // Write encrypted data immediately at tracked position
-            int written = delegate.write(ByteBuffer.wrap(encrypted), fileWritePosition);
+            int written = writeFully(ByteBuffer.wrap(encrypted), fileWritePosition);
             fileWritePosition += written;
 
             currentBlockBytesWritten += toWrite;
@@ -487,7 +487,7 @@ public class TranslogChunkManager {
         } finally {
             currentCipher = null;
         }
-        int written = delegate.write(ByteBuffer.wrap(tag), fileWritePosition);
+        int written = writeFully(ByteBuffer.wrap(tag), fileWritePosition);
         fileWritePosition += written;
     }
 
@@ -499,5 +499,56 @@ public class TranslogChunkManager {
             finalizeCurrentBlock();
             currentCipher = null;
         }
+    }
+
+    /**
+     * Writes the entire buffer to the delegate at the given position, looping until no bytes remain.
+     *
+     * <p>{@link FileChannel#write(ByteBuffer, long)} is permitted to write fewer bytes than requested
+     * (a partial write), which happens under I/O load. A single unchecked {@code write} can therefore
+     * silently drop the tail of an encrypted chunk, leaving a hole that misaligns every subsequent
+     * fixed-stride chunk and surfaces later as an {@code AEADBadTagException} during recovery. This
+     * mirrors OpenSearch core's {@code TranslogWriter.writeToFile}, which loops for the same reason.
+     *
+     * @param buffer the bytes to write fully
+     * @param position the starting file position
+     * @return the total number of bytes written (equal to the buffer's initial remaining)
+     * @throws IOException if a write returns a non-positive count or the channel fails
+     */
+    private int writeFully(ByteBuffer buffer, long position) throws IOException {
+        int total = 0;
+        while (buffer.hasRemaining()) {
+            int n = delegate.write(buffer, position + total);
+            if (n <= 0) {
+                throw new IOException(
+                    "Short write to translog: wrote " + total + " of " + (total + buffer.remaining()) + " bytes at position "
+                        + (position + total) + " file:" + filePath
+                );
+            }
+            total += n;
+        }
+        return total;
+    }
+
+    /**
+     * Reads into the buffer from the delegate at the given position, looping until the buffer is
+     * filled or a real EOF is reached. Guards the header path against partial reads being mistaken
+     * for end-of-data.
+     *
+     * @param dst the destination buffer
+     * @param position the starting file position
+     * @return the number of bytes read (less than requested only at genuine EOF)
+     * @throws IOException if the channel fails
+     */
+    private int readFully(ByteBuffer dst, long position) throws IOException {
+        int total = 0;
+        while (dst.hasRemaining()) {
+            int n = delegate.read(dst, position + total);
+            if (n <= 0) {
+                break; // genuine EOF or no more bytes currently available
+            }
+            total += n;
+        }
+        return total;
     }
 }
