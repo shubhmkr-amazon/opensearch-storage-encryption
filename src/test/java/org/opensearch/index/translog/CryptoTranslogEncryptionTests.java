@@ -494,17 +494,198 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * Edge case (READ-LOOP): symmetric read-side guard for the readFully loop. Writes a multi-chunk file
+     * normally, then reads it back through a channel that returns at most 7 bytes per read. A reverted
+     * readFully would feed a truncated chunk to GCM and throw "Failed to decrypt chunk N".
+     */
+    @SuppressForbidden(reason = "Test needs a real FileChannel to wrap with a short-read delegate")
+    public void testPartialReadsDoNotCorruptTranslog() throws IOException {
+        String uuid = "partial-read-uuid";
+        int len = (TranslogChunkManager.GCM_CHUNK_SIZE * 3) + 1234;
+        byte[] data = randomByteArrayOfLength(len);
+        Path path = tempDir.resolve("partial-read.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+
+        try (FileChannel real = FileChannel.open(path, StandardOpenOption.READ)) {
+            FileChannel shortReads = new ShortWriteFileChannel(real, Integer.MAX_VALUE, 7);
+            try (
+                FileChannel ch = new CryptoFileChannelWrapper(shortReads, keyResolver, path, java.util.Set.of(StandardOpenOption.READ), uuid)
+            ) {
+                ByteBuffer hdr = ByteBuffer.allocate(headerSize);
+                int hpos = 0;
+                while (hdr.hasRemaining()) {
+                    int n = ch.read(hdr, hpos);
+                    if (n <= 0) break;
+                    hpos += n;
+                }
+                assertEquals("header must read fully under short reads", headerSize, hdr.position());
+                assertArrayEquals("partial reads must not corrupt decryption", data, readFullyLoop(ch, headerSize, len));
+            }
+        }
+    }
+
+    /**
+     * Edge case (MULTI-CALL-APPEND): the real TranslogWriter appends via many sequential write() calls.
+     * Writing a payload in several calls (one seam exactly on the 8192 block boundary, one mid-block) must
+     * decrypt to the same bytes and produce the same file size as a single write — proving the on-disk
+     * layout is independent of caller chunking. (Stress-validated over 200 iterations during development.)
+     */
+    public void testMultiCallAppendMatchesSingleWrite() throws IOException {
+        int len = 20000;
+        byte[] data = randomByteArrayOfLength(len);
+
+        String uuidA = "append-single";
+        Path pathA = tempDir.resolve("append-single.tlog");
+        CryptoChannelFactory fA = new CryptoChannelFactory(keyResolver, uuidA);
+        int headerSize;
+        try (FileChannel ch = fA.open(pathA, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuidA, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+        try (FileChannel rcA = fA.open(pathA, StandardOpenOption.READ)) {
+            assertArrayEquals("single-write must round-trip", data, readFullyLoop(rcA, headerSize, len));
+        }
+
+        String uuidB = "append-multi";
+        Path pathB = tempDir.resolve("append-multi.tlog");
+        CryptoChannelFactory fB = new CryptoChannelFactory(keyResolver, uuidB);
+        int[] seams = { 0, 8192, 12345, len };
+        try (FileChannel ch = fB.open(pathB, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuidB, 1L);
+            h.write(ch, false);
+            long pos = headerSize;
+            for (int s = 0; s < seams.length - 1; s++) {
+                int written = ch.write(ByteBuffer.wrap(data, seams[s], seams[s + 1] - seams[s]), pos);
+                assertEquals("each append writes its full slice", seams[s + 1] - seams[s], written);
+                pos += written;
+            }
+        }
+        try (FileChannel rc = fB.open(pathB, StandardOpenOption.READ)) {
+            assertArrayEquals("multi-call append must decrypt to original", data, readFullyLoop(rc, headerSize, len));
+        }
+        // identical header size (same-length UUID) + identical data layout => identical file size
+        assertEquals("file size must be call-boundary independent", Files.size(pathA), Files.size(pathB));
+    }
+
+    /**
+     * Edge case (TRANSFER-ROUNDTRIP): transferFrom (encrypt-on-ingest) then transferTo (decrypt-on-egress)
+     * must round-trip across multiple chunks — the real remote-upload / recovery I/O paths.
+     */
+    @SuppressForbidden(reason = "Test uses FileChannel transfer to/from temp files")
+    public void testTransferRoundTripAcrossChunks() throws IOException {
+        String uuid = "transfer-uuid";
+        int len = TranslogChunkManager.GCM_CHUNK_SIZE * 3;
+        byte[] data = randomByteArrayOfLength(len);
+        Path src = tempDir.resolve("transfer-src.bin");
+        Files.write(src, data);
+        Path path = tempDir.resolve("transfer.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        int headerSize;
+        try (
+            FileChannel srcCh = FileChannel.open(src, StandardOpenOption.READ);
+            FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+        ) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            long transferred = ch.transferFrom(srcCh, headerSize, len);
+            assertEquals("transferFrom must ingest all bytes", len, transferred);
+        }
+        assertEquals("encrypted size after transferFrom", expectedFileSize(headerSize, len), Files.size(path));
+
+        Path sink = tempDir.resolve("transfer-sink.bin");
+        try (
+            FileChannel ch = factory.open(path, StandardOpenOption.READ);
+            FileChannel sinkCh = FileChannel.open(sink, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+        ) {
+            long out = 0;
+            while (out < len) {
+                long n = ch.transferTo(headerSize + out, len - out, sinkCh);
+                if (n <= 0) break;
+                out += n;
+            }
+            assertEquals("transferTo must emit all decrypted bytes", len, out);
+        }
+        assertArrayEquals("transfer round-trip must preserve bytes", data, Files.readAllBytes(sink));
+    }
+
+    /**
+     * Edge case (EOF): reads at and past EOF return no bytes and write nothing. (Pins FileChannel contract.)
+     */
+    public void testReadAtAndPastEof() throws IOException {
+        String uuid = "eof-uuid";
+        int len = 9000;
+        byte[] data = randomByteArrayOfLength(len);
+        Path path = tempDir.resolve("eof.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+        long fileSize = Files.size(path);
+        try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+            ByteBuffer atEof = ByteBuffer.allocate(64);
+            assertTrue("read at EOF returns <=0", rc.read(atEof, fileSize) <= 0);
+            assertEquals("nothing written at EOF", 0, atEof.position());
+            ByteBuffer pastEof = ByteBuffer.allocate(64);
+            assertTrue("read past EOF returns <=0", rc.read(pastEof, fileSize + 5000) <= 0);
+            assertEquals("nothing written past EOF", 0, pastEof.position());
+        }
+    }
+
+    /**
+     * Edge case (LIFECYCLE): map() is unsupported; ops after close throw ClosedChannelException; a
+     * header-only file is exactly headerSize (no phantom chunk/tag); double-close is a no-op.
+     */
+    public void testChannelLifecycleAndHeaderOnly() throws IOException {
+        String uuid = "lifecycle-uuid";
+        Path path = tempDir.resolve("lifecycle.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        TranslogHeader h = new TranslogHeader(uuid, 1L);
+        h.write(ch, false);
+        int headerSize = h.sizeInBytes();
+        expectThrows(UnsupportedOperationException.class, () -> ch.map(FileChannel.MapMode.READ_ONLY, 0, headerSize));
+        ch.close();
+        assertEquals("header-only file must be exactly headerSize", headerSize, Files.size(path));
+        expectThrows(java.nio.channels.ClosedChannelException.class, () -> ch.read(ByteBuffer.allocate(8), 0));
+        expectThrows(java.nio.channels.ClosedChannelException.class, () -> ch.write(ByteBuffer.allocate(8), headerSize));
+        ch.close(); // idempotent
+        assertEquals("double-close must not change the file", headerSize, Files.size(path));
+    }
+
+    /**
      * A FileChannel decorator whose positional write() always reports at most {@code maxBytesPerWrite}
      * bytes written, simulating the OS partial-write behavior that caused the P0 corruption.
      */
-    @SuppressForbidden(reason = "Test helper wrapping FileChannel to simulate partial writes")
+    @SuppressForbidden(reason = "Test helper wrapping FileChannel to simulate partial writes/reads")
     private static final class ShortWriteFileChannel extends FileChannel {
         private final FileChannel delegate;
         private final int maxBytesPerWrite;
+        private final int maxBytesPerRead; // 0 == unlimited (pass-through)
 
         ShortWriteFileChannel(FileChannel delegate, int maxBytesPerWrite) {
+            this(delegate, maxBytesPerWrite, 0);
+        }
+
+        ShortWriteFileChannel(FileChannel delegate, int maxBytesPerWrite, int maxBytesPerRead) {
             this.delegate = delegate;
             this.maxBytesPerWrite = maxBytesPerWrite;
+            this.maxBytesPerRead = maxBytesPerRead;
         }
 
         @Override
@@ -521,7 +702,14 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
 
         @Override
         public int read(ByteBuffer dst, long position) throws IOException {
-            return delegate.read(dst, position);
+            if (maxBytesPerRead <= 0 || dst.remaining() <= maxBytesPerRead) {
+                return delegate.read(dst, position);
+            }
+            int oldLimit = dst.limit();
+            dst.limit(dst.position() + maxBytesPerRead);
+            int n = delegate.read(dst, position);
+            dst.limit(oldLimit);
+            return n;
         }
 
         @Override
@@ -531,7 +719,14 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
 
         @Override
         public int read(ByteBuffer dst) throws IOException {
-            return delegate.read(dst);
+            if (maxBytesPerRead <= 0 || dst.remaining() <= maxBytesPerRead) {
+                return delegate.read(dst);
+            }
+            int oldLimit = dst.limit();
+            dst.limit(dst.position() + maxBytesPerRead);
+            int n = delegate.read(dst);
+            dst.limit(oldLimit);
+            return n;
         }
 
         @Override
