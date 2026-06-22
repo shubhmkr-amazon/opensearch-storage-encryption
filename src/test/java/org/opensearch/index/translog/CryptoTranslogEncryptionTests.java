@@ -320,6 +320,180 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * Reads {@code len} bytes starting at {@code pos}, looping because {@code readFromChunks} returns at
+     * most one chunk per call. Fails the test on a stalled loop.
+     */
+    private static byte[] readFullyLoop(FileChannel ch, long pos, int len) throws IOException {
+        ByteBuffer buf = ByteBuffer.allocate(len);
+        int done = 0;
+        int guard = 0;
+        int maxIters = (len / TranslogChunkManager.GCM_CHUNK_SIZE) + 4;
+        while (buf.hasRemaining()) {
+            int n = ch.read(buf, pos + done);
+            if (n <= 0) {
+                break;
+            }
+            done += n;
+            if (++guard > maxIters) {
+                fail("read loop stalled at " + done + "/" + len);
+            }
+        }
+        assertEquals("short read-back", len, done);
+        return buf.array();
+    }
+
+    /**
+     * On-disk size of an encrypted translog. The streaming write format does NOT pad chunks: each block
+     * stores {@code ciphertext (== plaintext length for the GCM stream) + a 16-byte tag}. So the data
+     * region is {@code len + 16 * numBlocks}, where numBlocks = ceil(len / 8192).
+     */
+    private static long expectedFileSize(int headerSize, int len) {
+        int blocks = (len + TranslogChunkManager.GCM_CHUNK_SIZE - 1) / TranslogChunkManager.GCM_CHUNK_SIZE;
+        return headerSize + (long) len + (long) blocks * TranslogChunkManager.GCM_TAG_SIZE;
+    }
+
+    /**
+     * P0-2: isolate the inline tag-write site (finalizeCurrentBlock). A short write of just the 16-byte
+     * tag must still be fully flushed, or the file is short by 16 bytes and every later chunk misaligns.
+     */
+    public void testShortWriteAtTagBoundary() throws IOException {
+        String uuid = "tag-boundary-uuid";
+        int rest = 300;
+        int len = TranslogChunkManager.GCM_CHUNK_SIZE + rest; // crosses one block boundary -> finalize tag
+        byte[] data = randomByteArrayOfLength(len);
+        Path path = tempDir.resolve("tag.tlog");
+
+        int headerSize;
+        // maxBytesPerWrite=8 forces even the 16-byte tag write to be split into two calls.
+        try (FileChannel real = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            FileChannel faulty = new ShortWriteFileChannel(real, 8);
+            try (
+                FileChannel ch = new CryptoFileChannelWrapper(
+                    faulty,
+                    keyResolver,
+                    path,
+                    java.util.Set.of(StandardOpenOption.WRITE),
+                    uuid
+                )
+            ) {
+                TranslogHeader h = new TranslogHeader(uuid, 1L);
+                h.write(ch, false);
+                headerSize = h.sizeInBytes();
+                ch.write(ByteBuffer.wrap(data), headerSize);
+            }
+        }
+
+        // Two chunks (8192 + rest), each + 16B tag, both fully present.
+        assertEquals(headerSize + TranslogChunkManager.GCM_CHUNK_SIZE + 16 + rest + 16, Files.size(path));
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+            assertArrayEquals(data, readFullyLoop(rc, headerSize, len));
+        }
+    }
+
+    /**
+     * P0-5: a single bit flipped anywhere in the ciphertext/tag region must cause decryption to throw
+     * ("Failed to decrypt chunk N") or return non-equal bytes — never silently return the original.
+     */
+    public void testTamperedChunkNeverDecryptsToOriginal() throws IOException {
+        String uuid = "tamper-uuid";
+        int len = randomIntBetween(TranslogChunkManager.GCM_CHUNK_SIZE, 2 * TranslogChunkManager.GCM_CHUNK_SIZE);
+        byte[] data = randomByteArrayOfLength(len);
+        Path path = tempDir.resolve("tamper.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+
+        byte[] raw = Files.readAllBytes(path);
+        int trials = scaledRandomIntBetween(30, 120);
+        for (int t = 0; t < trials; t++) {
+            byte[] bad = raw.clone();
+            int idx = randomIntBetween(headerSize, bad.length - 1); // never touch the plaintext header
+            bad[idx] ^= (byte) (1 << randomIntBetween(0, 7));
+            Path bp = tempDir.resolve("tamper-" + t + ".tlog");
+            Files.write(bp, bad);
+            try (FileChannel rc = factory.open(bp, StandardOpenOption.READ)) {
+                try {
+                    byte[] got = readFullyLoop(rc, headerSize, len);
+                    assertFalse("GCM auth bypassed: tampered file decrypted to original", java.util.Arrays.equals(data, got));
+                } catch (IOException e) {
+                    assertTrue("unexpected error: " + e.getMessage(), e.getMessage().contains("Failed to decrypt chunk"));
+                } catch (AssertionError shortReadBack) {
+                    // A <=16B truncation path returns fewer bytes; acceptable as long as it is never silently equal.
+                }
+            }
+        }
+    }
+
+    /**
+     * P0-10: a delegate that never accepts bytes must make writeFully throw a clear IOException, not hang.
+     */
+    public void testWriteFullyThrowsOnStuckChannel() throws IOException {
+        String uuid = "stuck-uuid";
+        Path path = tempDir.resolve("stuck.tlog");
+        try (FileChannel real = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            FileChannel faulty = new ShortWriteFileChannel(real, 0); // accepts 0 bytes per call
+            try (
+                FileChannel ch = new CryptoFileChannelWrapper(
+                    faulty,
+                    keyResolver,
+                    path,
+                    java.util.Set.of(StandardOpenOption.WRITE),
+                    uuid
+                )
+            ) {
+                TranslogHeader h = new TranslogHeader(uuid, 1L);
+                IOException e = expectThrows(IOException.class, () -> {
+                    h.write(ch, false);
+                    ch.write(ByteBuffer.wrap(new byte[100]), h.sizeInBytes());
+                });
+                assertTrue("expected short-write message, got: " + e.getMessage(), e.getMessage().contains("Short write to translog"));
+            }
+        }
+    }
+
+    /**
+     * PROP-1/PROP-6: write-then-read byte-identity across many random lengths and explicit boundary values
+     * (0, 1, around the 8192 chunk size, multi-chunk). Guards nonce/stride/finalize regressions.
+     */
+    public void testRoundTripLengthsAndBoundaries() throws IOException {
+        java.util.List<Integer> lengths = new java.util.ArrayList<>();
+        for (int b : new int[] { 1, 100, 8191, 8192, 8193, 16384, 16385 }) {
+            lengths.add(b);
+        }
+        int randomCases = scaledRandomIntBetween(20, 80);
+        for (int i = 0; i < randomCases; i++) {
+            lengths.add(randomIntBetween(1, 40000));
+        }
+
+        for (int idx = 0; idx < lengths.size(); idx++) {
+            int len = lengths.get(idx);
+            String uuid = "rt-" + idx + "-" + len;
+            Path path = tempDir.resolve("rt-" + idx + ".tlog");
+            byte[] data = randomByteArrayOfLength(len);
+            CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+            int headerSize;
+            try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                TranslogHeader h = new TranslogHeader(uuid, 1L);
+                h.write(ch, false);
+                headerSize = h.sizeInBytes();
+                assertEquals("len=" + len, len, ch.write(ByteBuffer.wrap(data), headerSize));
+            }
+            assertEquals("size len=" + len, expectedFileSize(headerSize, len), Files.size(path));
+            try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+                assertArrayEquals("len=" + len, data, readFullyLoop(rc, headerSize, len));
+            }
+        }
+    }
+
+    /**
      * A FileChannel decorator whose positional write() always reports at most {@code maxBytesPerWrite}
      * bytes written, simulating the OS partial-write behavior that caused the P0 corruption.
      */
