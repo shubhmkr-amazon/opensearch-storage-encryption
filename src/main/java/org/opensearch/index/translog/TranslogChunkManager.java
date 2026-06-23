@@ -118,8 +118,15 @@ public class TranslogChunkManager {
         // Non-translog files (.ckp) don't need encryption anyway
         this.actualHeaderSize = filePath.getFileName().toString().endsWith(".tlog") ? calculateTranslogHeaderSize(translogUUID) : 0;
 
-        // Derive base IV using HKDF instead of random IV from KeyResolver
-        this.baseIV = HkdfKeyDerivation.deriveTranslogBaseIV(keyResolver.getDataKey().getEncoded(), translogUUID);
+        // Derive base IV using HKDF. The generation (parsed from the translog-N.tlog filename) is folded
+        // into the derivation so each generation gets a DISTINCT base IV — otherwise chunk 0 of every
+        // generation file would reuse the same (key, nonce) on different plaintext (catastrophic GCM
+        // nonce reuse). The generation is reconstructable identically at write and read time.
+        long generation = parseGenerationFromFileName(filePath);
+        byte[] dataKey = keyResolver.getDataKey().getEncoded();
+        this.baseIV = generation >= 0
+            ? HkdfKeyDerivation.deriveTranslogBaseIV(dataKey, translogUUID, generation)
+            : HkdfKeyDerivation.deriveTranslogBaseIV(dataKey, translogUUID);
     }
 
     /**
@@ -152,6 +159,32 @@ public class TranslogChunkManager {
         }
 
         return size;
+    }
+
+    /**
+     * Parses the generation number from a translog filename of the form {@code translog-<N>.tlog}.
+     *
+     * <p>Used to derive a per-generation base IV (see the constructor). The generation is part of the
+     * filename written by OpenSearch core and is therefore available identically when the file is
+     * written and when it is later reopened for read/recovery — no runtime state is required.
+     *
+     * @param filePath the translog file path
+     * @return the generation number, or {@code -1} if the name is not a {@code translog-N.tlog} file
+     */
+    static long parseGenerationFromFileName(Path filePath) {
+        if (filePath == null) {
+            return -1;
+        }
+        String name = filePath.getFileName().toString();
+        if (!name.startsWith("translog-") || !name.endsWith(".tlog")) {
+            return -1;
+        }
+        String gen = name.substring("translog-".length(), name.length() - ".tlog".length());
+        try {
+            return Long.parseLong(gen);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     /**
@@ -213,10 +246,13 @@ public class TranslogChunkManager {
                 return new byte[0];
             }
 
-            // Read encrypted chunk + tag from disk using pooled buffer
+            // Read encrypted chunk + tag from disk using pooled buffer.
+            // Must read fully: a single delegate.read may return a partial count, which would feed a
+            // truncated buffer to GCM and fail authentication. The pooled buffer caps at
+            // CHUNK_WITH_TAG_SIZE, so this reads exactly one chunk (or up to EOF for a short last chunk).
             ByteBuffer buffer = CHUNK_BUFFER_POOL.get();
             buffer.clear();
-            int bytesRead = delegate.read(buffer, diskPosition);
+            int bytesRead = readFully(buffer, diskPosition);
 
             if (bytesRead <= GCM_TAG_SIZE) {
                 return new byte[0]; // Empty or invalid chunk

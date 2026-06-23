@@ -114,4 +114,30 @@ public class HkdfKeyDerivation {
         System.arraycopy(uuidBytes, 0, paddedUuid, 0, Math.min(uuidBytes.length, 16));
         return deriveKey(masterKey, paddedUuid, "translog-base-iv", 16);
     }
+
+    /**
+     * Derive a per-generation base IV for translog encryption.
+     *
+     * <p>The {@code translogUUID} is constant across every generation file of a translog and the data
+     * key is stable per shard, so deriving the base IV from {@code (dataKey, translogUUID)} alone makes
+     * chunk 0 of every {@code translog-N.tlog} reuse the same {@code (key, nonce)} on different plaintext
+     * — a catastrophic AES-GCM nonce reuse. Folding the generation number into the HKDF {@code info}
+     * gives each generation a distinct base IV, so the per-chunk nonces never collide across generations.
+     *
+     * <p>The generation is taken from the {@code translog-N.tlog} filename and is therefore reconstructable
+     * identically at write and read time without any runtime state.
+     *
+     * @param masterKey the master key (32 bytes)
+     * @param translogUUID the translog UUID string (constant across generations)
+     * @param generation the translog generation number (distinct per file)
+     * @return derived 16-byte base IV unique to this (translogUUID, generation)
+     */
+    public static byte[] deriveTranslogBaseIV(byte[] masterKey, String translogUUID, long generation) {
+        byte[] uuidBytes = translogUUID.getBytes(StandardCharsets.UTF_8);
+        byte[] paddedUuid = new byte[16];
+        System.arraycopy(uuidBytes, 0, paddedUuid, 0, Math.min(uuidBytes.length, 16));
+        // Domain-separated, generation-bound context. The fixed prefix keeps it distinct from any other
+        // HKDF use of the same (masterKey, messageId); the generation makes it unique per file.
+        return deriveKey(masterKey, paddedUuid, "translog-base-iv|gen=" + generation, 16);
+    }
 }

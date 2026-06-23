@@ -494,6 +494,56 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * C1 regression: chunk 0 of two DIFFERENT generation files (same translogUUID, same data key, same
+     * plaintext) must encrypt to DIFFERENT ciphertext on disk. Before the generation-bound base-IV fix,
+     * the base IV depended only on (dataKey, translogUUID) and chunkIndex restarted at 0 per file, so
+     * chunk 0 of translog-1.tlog and translog-2.tlog reused the same (key, nonce) — catastrophic GCM
+     * reuse. Identical ciphertext for the same plaintext across generations means the nonce was reused.
+     */
+    public void testDifferentGenerationsProduceDifferentCiphertext() throws IOException {
+        String uuid = "gen-nonce-uuid";
+        byte[] data = randomByteArrayOfLength(4096);
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        java.util.function.Function<Integer, byte[]> writeGen = gen -> {
+            try {
+                Path path = tempDir.resolve("translog-" + gen + ".tlog");
+                int headerSize;
+                try (
+                    FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+                ) {
+                    TranslogHeader h = new TranslogHeader(uuid, 1L);
+                    h.write(ch, false);
+                    headerSize = h.sizeInBytes();
+                    ch.write(ByteBuffer.wrap(data), headerSize);
+                }
+                // return the ciphertext region only (skip the plaintext header, which is identical anyway)
+                byte[] all = Files.readAllBytes(path);
+                return java.util.Arrays.copyOfRange(all, headerSize, all.length);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+
+        byte[] ctGen1 = writeGen.apply(1);
+        byte[] ctGen2 = writeGen.apply(2);
+
+        assertFalse(
+            "chunk-0 ciphertext must differ across generations (same nonce => GCM reuse)",
+            java.util.Arrays.equals(ctGen1, ctGen2)
+        );
+
+        // and each generation must still decrypt back to the original through its own filename
+        for (int gen : new int[] { 1, 2 }) {
+            Path path = tempDir.resolve("translog-" + gen + ".tlog");
+            int headerSize = new TranslogHeader(uuid, 1L).sizeInBytes();
+            try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+                assertArrayEquals("gen " + gen + " must round-trip", data, readFullyLoop(rc, headerSize, data.length));
+            }
+        }
+    }
+
+    /**
      * Edge case (READ-LOOP): symmetric read-side guard for the readFully loop. Writes a multi-chunk file
      * normally, then reads it back through a channel that returns at most 7 bytes per read. A reverted
      * readFully would feed a truncated chunk to GCM and throw "Failed to decrypt chunk N".
