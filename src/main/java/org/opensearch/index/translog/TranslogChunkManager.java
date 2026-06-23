@@ -6,7 +6,6 @@ package org.opensearch.index.translog;
 
 
 import java.io.IOException;
-import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.NonReadableChannelException;
@@ -19,7 +18,6 @@ import java.security.Key;
 import org.apache.lucene.codecs.CodecUtil;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.cipher.AesGcmCipherFactory;
-import org.opensearch.index.store.cipher.OpenSslNativeCipher;
 import org.opensearch.index.store.key.HkdfKeyDerivation;
 import org.opensearch.index.store.key.KeyResolver;
 
@@ -47,10 +45,7 @@ public class TranslogChunkManager {
     public static final int CHUNK_WITH_TAG_SIZE = GCM_CHUNK_SIZE + GCM_TAG_SIZE;
 
     // Thread-local buffer pool for reducing allocations
-    private static final ThreadLocal<ByteBuffer> CHUNK_BUFFER_POOL = ThreadLocal
-        .withInitial(() -> ByteBuffer.allocate(CHUNK_WITH_TAG_SIZE));
     private static final ThreadLocal<ByteBuffer> TRANSFER_BUFFER_POOL = ThreadLocal.withInitial(() -> ByteBuffer.allocate(GCM_CHUNK_SIZE));
-    private static final ThreadLocal<byte[]> TEMP_ARRAY_POOL = ThreadLocal.withInitial(() -> new byte[GCM_CHUNK_SIZE]);
 
     private final FileChannel delegate;
     private final KeyResolver keyResolver;
@@ -63,15 +58,21 @@ public class TranslogChunkManager {
     // Base IV derived using HKDF for deterministic translog encryption
     private final byte[] baseIV;
 
-    // Streaming cipher state for write operations
-    private MemorySegment currentCipher;
-    private long currentBlockNumber = 0;
-    private int currentBlockBytesWritten = 0;
+    // ---- v2 seal-on-force format ----
+    // Each on-disk block is: [u16 ptLen big-endian][ptLen bytes ciphertext][16 byte GCM tag].
+    // Blocks are buffered in memory and SEALED (encrypted + tag written) when full, on force(), or on
+    // close() — so a force()/checkpoint is always backed by complete, tagged, durable chunks (C2 fix).
+    /** Length-prefix size in bytes (u16 big-endian plaintext length, 1..8192). */
+    public static final int LENGTH_PREFIX_SIZE = 2;
     private static final int BLOCK_SIZE_SHIFT = 13;
-    private static final int BLOCK_SIZE = 1 << BLOCK_SIZE_SHIFT; // 8KB blocks
-    private long fileWritePosition = 0;
-    // Total plaintext bytes streamed so far (excludes inline tags). Used to enforce the append-only
-    // contract (M4): the next data write must arrive at exactly headerSize + logicalDataWritten.
+    private static final int BLOCK_SIZE = 1 << BLOCK_SIZE_SHIFT; // 8KB max plaintext per block
+
+    // Write-side state
+    private final byte[] blockBuf = new byte[BLOCK_SIZE]; // accumulates the open (unsealed) block's plaintext
+    private int blockBufLen = 0;                          // bytes currently buffered in the open block
+    private long currentBlockNumber = 0;                  // index of the open block (== sealed blocks so far)
+    private long fileWritePosition = 0;                   // disk write cursor (after the last sealed block)
+    // Total plaintext bytes accepted so far (sealed + buffered). Enforces append-only (M4).
     private long logicalDataWritten = 0;
 
     /**
@@ -189,126 +190,127 @@ public class TranslogChunkManager {
         }
     }
 
-    /**
-     * Maps a file position to chunk information including chunk index and offset within chunk.
-     *
-     * @param filePosition the logical file position to map to chunk coordinates
-     * @return chunk information containing index, offset, and disk position
-     */
-    public ChunkInfo getChunkInfo(long filePosition) {
-        long dataPosition = filePosition - determineHeaderSize();
-        int chunkIndex = (int) (dataPosition / GCM_CHUNK_SIZE);
-        int offsetInChunk = (int) (dataPosition % GCM_CHUNK_SIZE);
-        long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
-        return new ChunkInfo(chunkIndex, offsetInChunk, diskPosition);
-    }
+    // ---- Read-side variable-length block index (v2) ----
+    // Built by scanning the [u16 ptLen][ct][tag] records from the header to EOF. For block i:
+    //   blockDiskOffset[i] = byte offset of its u16 length prefix
+    //   blockPlainOffset[i] = cumulative plaintext bytes before block i (logical offset of its first byte)
+    //   blockPtLen[i] = plaintext length of block i
+    // Rebuilt lazily and whenever the on-disk size grows (a concurrent writer sealed more blocks).
+    private long[] blockDiskOffset = new long[0];
+    private long[] blockPlainOffset = new long[0];
+    private int[] blockPtLen = new int[0];
+    private int indexedBlockCount = 0;
+    private long indexedFileSize = -1;
 
-    /**
-     * Checks if we can read a chunk at the given disk position.
-     * Returns false for write-only channels or if chunk doesn't exist.
-     *
-     * @param diskPosition the disk position where the chunk should be located
-     * @return true if the chunk exists and can be read, false otherwise
-     */
-    public boolean canReadChunk(long diskPosition) {
-        try {
-            // Check if position is beyond current file size (new chunk)
-            if (diskPosition >= delegate.size()) {
-                return false;
-            }
-
-            // Test if channel is readable by attempting a zero-byte read
-            ByteBuffer testBuffer = ByteBuffer.allocate(0);
-            delegate.read(testBuffer, diskPosition);
-            return true;
-
-        } catch (NonReadableChannelException | IOException e) {
-            // Channel is write-only
-            return false;
+    private void ensureIndex() throws IOException {
+        long size = delegate.size();
+        if (size == indexedFileSize) {
+            return; // up to date
         }
-        // Other read errors - assume can't read
-
+        int headerSize = determineHeaderSize();
+        java.util.ArrayList<Long> diskOffs = new java.util.ArrayList<>();
+        java.util.ArrayList<Long> plainOffs = new java.util.ArrayList<>();
+        java.util.ArrayList<Integer> ptLens = new java.util.ArrayList<>();
+        long pos = headerSize;
+        long plain = 0;
+        ByteBuffer lenBuf = ByteBuffer.allocate(LENGTH_PREFIX_SIZE);
+        while (pos + LENGTH_PREFIX_SIZE <= size) {
+            lenBuf.clear();
+            int n = readFully(lenBuf, pos);
+            if (n < LENGTH_PREFIX_SIZE) {
+                break; // torn trailing length prefix — ignore (beyond last durable block)
+            }
+            lenBuf.flip();
+            int ptLen = lenBuf.getShort() & 0xFFFF;
+            long recordEnd = pos + LENGTH_PREFIX_SIZE + (long) ptLen + GCM_TAG_SIZE;
+            if (ptLen == 0 || ptLen > GCM_CHUNK_SIZE || recordEnd > size) {
+                break; // torn/partial trailing record — ignore
+            }
+            diskOffs.add(pos);
+            plainOffs.add(plain);
+            ptLens.add(ptLen);
+            plain += ptLen;
+            pos = recordEnd;
+        }
+        blockDiskOffset = diskOffs.stream().mapToLong(Long::longValue).toArray();
+        blockPlainOffset = plainOffs.stream().mapToLong(Long::longValue).toArray();
+        blockPtLen = ptLens.stream().mapToInt(Integer::intValue).toArray();
+        indexedBlockCount = blockDiskOffset.length;
+        indexedFileSize = size;
     }
 
     /**
-     * Reads and decrypts a complete chunk from disk.
-     * Returns empty array if chunk doesn't exist or channel is write-only.
+     * Maps a logical file position to the block that contains it (block index + offset within the block's
+     * decrypted plaintext + the disk offset of the block record). Uses the variable-length block index.
      *
-     * @param chunkIndex the index of the chunk to read and decrypt
-     * @return the decrypted chunk data, or empty array if chunk doesn't exist
+     * @param filePosition the logical file position to map
+     * @return chunk info, or a chunkIndex of -1 if the position is at/after the end of indexed data
+     * @throws IOException if the index cannot be built
+     */
+    public ChunkInfo getChunkInfo(long filePosition) throws IOException {
+        ensureIndex();
+        long dataPosition = filePosition - determineHeaderSize();
+        if (indexedBlockCount == 0 || dataPosition < 0) {
+            return new ChunkInfo(-1, 0, determineHeaderSize());
+        }
+        // binary search for the block whose plaintext range contains dataPosition
+        int lo = 0, hi = indexedBlockCount - 1, found = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long start = blockPlainOffset[mid];
+            long end = start + blockPtLen[mid];
+            if (dataPosition < start) {
+                hi = mid - 1;
+            } else if (dataPosition >= end) {
+                lo = mid + 1;
+            } else {
+                found = mid;
+                break;
+            }
+        }
+        if (found < 0) {
+            return new ChunkInfo(-1, 0, determineHeaderSize());
+        }
+        int offsetInChunk = (int) (dataPosition - blockPlainOffset[found]);
+        return new ChunkInfo(found, offsetInChunk, blockDiskOffset[found]);
+    }
+
+    /**
+     * Reads and decrypts the block at the given index. Returns empty if the index is out of range or the
+     * channel is write-only.
+     *
+     * @param chunkIndex the block index to read and decrypt
+     * @return the decrypted block plaintext, or empty array if not present
      * @throws IOException if reading or decryption fails
      */
     public byte[] readAndDecryptChunk(int chunkIndex) throws IOException {
         try {
-            // Calculate disk position for this chunk
-            long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
-
-            // Check if position is beyond current file size (new chunk)
-            if (diskPosition >= delegate.size()) {
+            ensureIndex();
+            if (chunkIndex < 0 || chunkIndex >= indexedBlockCount) {
                 return new byte[0];
             }
+            long recordPos = blockDiskOffset[chunkIndex];
+            int ptLen = blockPtLen[chunkIndex];
+            int ctWithTag = ptLen + GCM_TAG_SIZE;
 
-            // Read encrypted chunk + tag from disk using pooled buffer.
-            // Must read fully: a single delegate.read may return a partial count, which would feed a
-            // truncated buffer to GCM and fail authentication. The pooled buffer caps at
-            // CHUNK_WITH_TAG_SIZE, so this reads exactly one chunk (or up to EOF for a short last chunk).
-            ByteBuffer buffer = CHUNK_BUFFER_POOL.get();
-            buffer.clear();
-            int bytesRead = readFully(buffer, diskPosition);
-
-            if (bytesRead <= GCM_TAG_SIZE) {
-                return new byte[0]; // Empty or invalid chunk
+            // skip the u16 length prefix, read ciphertext+tag fully
+            ByteBuffer buffer = ByteBuffer.allocate(ctWithTag);
+            int bytesRead = readFully(buffer, recordPos + LENGTH_PREFIX_SIZE);
+            if (bytesRead < ctWithTag) {
+                // torn trailing block beyond the last durable record — treat as absent
+                return new byte[0];
             }
+            byte[] encryptedWithTag = buffer.array();
 
-            // Extract encrypted data with tag
-            byte[] encryptedWithTag = new byte[bytesRead];
-            buffer.flip();
-            buffer.get(encryptedWithTag);
-
-            // Use existing key management
             Key key = keyResolver.getDataKey();
-
-            // Per-block 12-byte GCM nonce (baseIV[0:8] || BE32(chunkIndex)). MUST match the write path's
-            // nonce for the same block index, or decryption fails. See AesGcmCipherFactory.computeGcmNonce.
+            // Per-block nonce MUST match the write path: baseIV[0:8] || BE32(blockIndex).
             byte[] chunkIV = AesGcmCipherFactory.computeGcmNonce(baseIV, chunkIndex);
-
-            // Use existing GCM decryption with authentication
-            byte[] decrypted = AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
-            return decrypted;
+            return AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
 
         } catch (NonReadableChannelException e) {
-            // Channel is write-only
             return new byte[0];
         } catch (IOException | AesGcmCipherFactory.JavaCryptoException e) {
             throw new IOException("Failed to decrypt chunk " + chunkIndex, e);
-        }
-    }
-
-    /**
-     * Encrypts and writes a complete chunk to disk.
-     *
-     * @param chunkIndex the index of the chunk to encrypt and write
-     * @param plainData the plain data to encrypt and write to the chunk
-     * @throws IOException if encryption or writing fails
-     */
-    public void encryptAndWriteChunk(int chunkIndex, byte[] plainData) throws IOException {
-        try {
-            // Use existing key management
-            Key key = keyResolver.getDataKey();
-
-            // Per-block 12-byte GCM nonce (baseIV[0:8] || BE32(chunkIndex)) — unique per block.
-            byte[] chunkIV = AesGcmCipherFactory.computeGcmNonce(baseIV, chunkIndex);
-
-            // Use existing GCM encryption (includes authentication tag)
-            byte[] encryptedWithTag = AesGcmCipherFactory.encryptWithTag(key, chunkIV, plainData, plainData.length);
-
-            // Write to disk at chunk position
-            long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
-            ByteBuffer buffer = ByteBuffer.wrap(encryptedWithTag);
-            writeFully(buffer, diskPosition);
-
-        } catch (IOException | AesGcmCipherFactory.JavaCryptoException e) {
-            throw new IOException("Failed to encrypt chunk " + chunkIndex + " in file " + filePath, e);
         }
     }
 
@@ -407,44 +409,67 @@ public class TranslogChunkManager {
 
         int totalWritten = 0;
 
-        // Initialize new cipher
-        if (currentCipher == null) {
-            initializeBlockCipher(currentBlockNumber++);
-        }
-
+        // Buffer plaintext into the open block; seal whenever the block fills to BLOCK_SIZE.
         while (src.hasRemaining()) {
-            // Finalize cipher when block is full and initialize new cipher
-            if (currentCipher != null && currentBlockBytesWritten >= BLOCK_SIZE) {
-                finalizeCurrentBlock();
-                initializeBlockCipher(currentBlockNumber++);
-            }
-
-            // Write what fits in current block
-            int toWrite = Math.min(src.remaining(), BLOCK_SIZE - currentBlockBytesWritten);
-
-            // Use pooled array to avoid allocation
-            byte[] plainData = TEMP_ARRAY_POOL.get();
-            src.get(plainData, 0, toWrite);
-
-            // Stream encrypt using current cipher (no tag yet)
-            byte[] encrypted;
-            try {
-                encrypted = OpenSslNativeCipher.encryptUpdate(currentCipher, java.util.Arrays.copyOf(plainData, toWrite));
-            } catch (Throwable e) {
-                OpenSslNativeCipher.freeCipherContext(currentCipher);
-                throw new IOException("Failed to encrypt translog data at offset:" + fileWritePosition + " file:" + filePath, e);
-            }
-
-            // Write encrypted data immediately at tracked position
-            int written = writeFully(ByteBuffer.wrap(encrypted), fileWritePosition);
-            fileWritePosition += written;
-
-            currentBlockBytesWritten += toWrite;
+            int toWrite = Math.min(src.remaining(), BLOCK_SIZE - blockBufLen);
+            src.get(blockBuf, blockBufLen, toWrite);
+            blockBufLen += toWrite;
             totalWritten += toWrite;
             logicalDataWritten += toWrite;
+
+            if (blockBufLen == BLOCK_SIZE) {
+                sealCurrentBlock();
+            }
         }
 
         return totalWritten;
+    }
+
+    /**
+     * Seals the open block: GCM-encrypts the buffered plaintext under this block's per-block nonce and
+     * writes {@code [u16 ptLen][ciphertext][16B tag]} to disk, then advances to the next block.
+     *
+     * <p>No-op if the open block is empty. After a successful seal the on-disk file ends on a complete,
+     * authenticated chunk — this is what makes {@link #flushSeal()} (called from {@code force()}) able to
+     * make every checkpoint durable (the C2 fix).
+     *
+     * @throws IOException if encryption or writing fails
+     */
+    private void sealCurrentBlock() throws IOException {
+        if (blockBufLen == 0) {
+            return;
+        }
+        if (currentBlockNumber > Integer.MAX_VALUE) {
+            throw new IOException("translog block index " + currentBlockNumber + " exceeds maximum addressable block for file:" + filePath);
+        }
+        try {
+            Key key = keyResolver.getDataKey();
+            byte[] nonce = AesGcmCipherFactory.computeGcmNonce(baseIV, (int) currentBlockNumber);
+            byte[] cipherWithTag = AesGcmCipherFactory.encryptWithTag(key, nonce, blockBuf, blockBufLen);
+
+            ByteBuffer record = ByteBuffer.allocate(LENGTH_PREFIX_SIZE + cipherWithTag.length);
+            record.putShort((short) blockBufLen); // 1..8192 fits in u16
+            record.put(cipherWithTag);
+            record.flip();
+            int written = writeFully(record, fileWritePosition);
+            fileWritePosition += written;
+
+            currentBlockNumber++;
+            blockBufLen = 0;
+        } catch (AesGcmCipherFactory.JavaCryptoException e) {
+            throw new IOException("Failed to seal translog block " + currentBlockNumber + " for file:" + filePath, e);
+        }
+    }
+
+    /**
+     * Seals any buffered (open) block so its ciphertext+tag are on disk. Called by
+     * {@code CryptoFileChannelWrapper.force()} before {@code delegate.force()} and by {@link #close()} —
+     * guaranteeing every fsynced/checkpointed byte belongs to a complete, authenticated chunk (C2).
+     *
+     * @throws IOException if sealing fails
+     */
+    public void flushSeal() throws IOException {
+        sealCurrentBlock();
     }
 
     /**
@@ -526,61 +551,12 @@ public class TranslogChunkManager {
     }
 
     /**
-     * Initialize GCM cipher for a new block
-     */
-    private void initializeBlockCipher(long blockNumber) throws IOException {
-        Key key = keyResolver.getDataKey();
-
-        // Per-block GCM nonce: baseIV[0:8] || BE32(blockNumber). blockNumber == the chunk index of the
-        // block (both count 8192-byte blocks from 0), so this matches readAndDecryptChunk's nonce exactly.
-        // Guard the 32-bit block-index domain (M3): beyond 2^31-1 blocks the nonce counter would alias.
-        if (blockNumber > Integer.MAX_VALUE) {
-            throw new IOException("translog block index " + blockNumber + " exceeds maximum addressable block for file:" + filePath);
-        }
-        byte[] nonce = AesGcmCipherFactory.computeGcmNonce(baseIV, (int) blockNumber);
-        // initGCMCipher requires a 16-byte IV but uses only the first 12 bytes (the GCM nonce); pad it.
-        byte[] iv16 = new byte[16];
-        System.arraycopy(nonce, 0, iv16, 0, nonce.length);
-
-        try {
-            this.currentCipher = OpenSslNativeCipher.initGCMCipher(key.getEncoded(), iv16, 0L);
-        } catch (Throwable e) {
-            throw new IOException("Failed to initialize cipher for blockNumber:" + blockNumber + " for file:" + filePath, e);
-        }
-
-        // NOTE: do NOT reassign currentBlockNumber here. The caller (writeToChunks) advances it via
-        // currentBlockNumber++ when selecting the block to initialize; reassigning it to blockNumber
-        // would undo that increment and pin every block to the same nonce index (GCM nonce reuse).
-        this.currentBlockBytesWritten = 0;
-    }
-
-    /**
-     * Finalize current block and write tag inline
-     */
-    private void finalizeCurrentBlock() throws IOException {
-        if (currentCipher == null) {
-            return;
-        }
-        byte[] tag;
-        try {
-            tag = OpenSslNativeCipher.finalizeAndGetTag(currentCipher);
-        } catch (Throwable e) {
-            throw new IOException("Failed to finalize cipher for file:" + filePath, e);
-        } finally {
-            currentCipher = null;
-        }
-        int written = writeFully(ByteBuffer.wrap(tag), fileWritePosition);
-        fileWritePosition += written;
-    }
-
-    /**
-     * Close and finalize last block
+     * Seals any buffered (open) block, so the final partial block's ciphertext+tag are durable on disk.
+     *
+     * @throws IOException if sealing fails
      */
     public void close() throws IOException {
-        if (currentCipher != null) {
-            finalizeCurrentBlock();
-            currentCipher = null;
-        }
+        flushSeal();
     }
 
     /**

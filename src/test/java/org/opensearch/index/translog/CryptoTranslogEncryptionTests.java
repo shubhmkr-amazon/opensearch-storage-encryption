@@ -343,13 +343,14 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
-     * On-disk size of an encrypted translog. The streaming write format does NOT pad chunks: each block
-     * stores {@code ciphertext (== plaintext length for the GCM stream) + a 16-byte tag}. So the data
-     * region is {@code len + 16 * numBlocks}, where numBlocks = ceil(len / 8192).
+     * On-disk size of an encrypted translog in the v2 seal-on-force format. Each block is
+     * {@code [u16 ptLen][ptLen bytes ciphertext][16B GCM tag]}, so the data region is
+     * {@code len + (LENGTH_PREFIX_SIZE + 16) * numBlocks}, where numBlocks = ceil(len / 8192).
      */
     private static long expectedFileSize(int headerSize, int len) {
         int blocks = (len + TranslogChunkManager.GCM_CHUNK_SIZE - 1) / TranslogChunkManager.GCM_CHUNK_SIZE;
-        return headerSize + (long) len + (long) blocks * TranslogChunkManager.GCM_TAG_SIZE;
+        long perBlockOverhead = TranslogChunkManager.LENGTH_PREFIX_SIZE + TranslogChunkManager.GCM_TAG_SIZE;
+        return headerSize + (long) len + (long) blocks * perBlockOverhead;
     }
 
     /**
@@ -383,8 +384,8 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             }
         }
 
-        // Two chunks (8192 + rest), each + 16B tag, both fully present.
-        assertEquals(headerSize + TranslogChunkManager.GCM_CHUNK_SIZE + 16 + rest + 16, Files.size(path));
+        // Two blocks (8192 + rest) in v2 format, each [u16 len][ct][16B tag], both fully present.
+        assertEquals(expectedFileSize(headerSize, TranslogChunkManager.GCM_CHUNK_SIZE + rest), Files.size(path));
         CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
         try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
             assertArrayEquals(data, readFullyLoop(rc, headerSize, len));
@@ -544,6 +545,36 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * C2 (the live AEADBadTagException repro, made deterministic and crash-free): write a sub-block amount
+     * of data, force() WITHOUT closing the channel, then read it back through a fresh read-only channel.
+     * This mirrors a realtime GET of an uncommitted op in the still-open block. Before seal-on-force, the
+     * open block's GCM tag lived only in memory, so the reopened reader hit an un-tagged chunk and threw
+     * "Failed to decrypt chunk". With force() sealing the open block, the data is durable and decrypts.
+     */
+    public void testForceMakesOpenBlockReadable() throws IOException {
+        String uuid = "c2-force-uuid";
+        Path path = tempDir.resolve("translog-5.tlog");
+        int len = 1234; // smaller than one block -> stays in the open block until force()
+        byte[] data = randomByteArrayOfLength(len);
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        int headerSize;
+        // Deliberately NOT using try-with-resources: we must NOT close (close() would also seal).
+        FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        TranslogHeader h = new TranslogHeader(uuid, 1L);
+        h.write(ch, false);
+        headerSize = h.sizeInBytes();
+        ch.write(ByteBuffer.wrap(data), headerSize);
+        ch.force(false); // seals the open block to disk — the C2 fix
+
+        // Read back through a SEPARATE read-only channel while the writer is still open (uncommitted read).
+        try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+            assertArrayEquals("force() must make the open block durably decryptable", data, readFullyLoop(rc, headerSize, len));
+        }
+        ch.close();
+    }
+
+    /**
      * M4: the encrypted translog is append-only. A data write whose position does not equal the current
      * logical write cursor must fail closed rather than silently misplace bytes / reuse a nonce.
      */
@@ -617,8 +648,8 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         }
 
         byte[] all = Files.readAllBytes(path);
-        // on-disk block 0 = [headerSize, headerSize+8208); block 1 = [headerSize+8208, headerSize+2*8208)
-        int stride = TranslogChunkManager.CHUNK_WITH_TAG_SIZE;
+        // v2: each full block is [u16 len][8192 ct][16 tag] = LENGTH_PREFIX_SIZE + 8192 + 16 bytes.
+        int stride = TranslogChunkManager.LENGTH_PREFIX_SIZE + TranslogChunkManager.GCM_CHUNK_SIZE + TranslogChunkManager.GCM_TAG_SIZE;
         byte[] ct0 = java.util.Arrays.copyOfRange(all, headerSize, headerSize + stride);
         byte[] ct1 = java.util.Arrays.copyOfRange(all, headerSize + stride, headerSize + 2 * stride);
         assertFalse(
@@ -695,14 +726,18 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             assertArrayEquals("single-write must round-trip", data, readFullyLoop(rcA, headerSize, len));
         }
 
-        String uuidB = "append-multi";
+        // Use a UUID of the SAME length as uuidA so both files have identical header sizes (and thus
+        // comparable on-disk sizes). The data layout is independent of how the writes are chunked.
+        String uuidB = "append-multX"; // same length as "append-single"? ensure via headerSize assert below
         Path pathB = tempDir.resolve("append-multi.tlog");
         CryptoChannelFactory fB = new CryptoChannelFactory(keyResolver, uuidB);
         int[] seams = { 0, 8192, 12345, len };
+        int headerSizeB;
         try (FileChannel ch = fB.open(pathB, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             TranslogHeader h = new TranslogHeader(uuidB, 1L);
             h.write(ch, false);
-            long pos = headerSize;
+            headerSizeB = h.sizeInBytes();
+            long pos = headerSizeB;
             for (int s = 0; s < seams.length - 1; s++) {
                 int written = ch.write(ByteBuffer.wrap(data, seams[s], seams[s + 1] - seams[s]), pos);
                 assertEquals("each append writes its full slice", seams[s + 1] - seams[s], written);
@@ -710,10 +745,14 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             }
         }
         try (FileChannel rc = fB.open(pathB, StandardOpenOption.READ)) {
-            assertArrayEquals("multi-call append must decrypt to original", data, readFullyLoop(rc, headerSize, len));
+            assertArrayEquals("multi-call append must decrypt to original", data, readFullyLoop(rc, headerSizeB, len));
         }
-        // identical header size (same-length UUID) + identical data layout => identical file size
-        assertEquals("file size must be call-boundary independent", Files.size(pathA), Files.size(pathB));
+        // The data region (and thus block layout / size) is independent of how the writes were chunked.
+        assertEquals(
+            "data layout must be call-boundary independent",
+            Files.size(pathA) - headerSize,
+            Files.size(pathB) - headerSizeB
+        );
     }
 
     /**

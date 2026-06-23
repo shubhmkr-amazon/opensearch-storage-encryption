@@ -230,6 +230,16 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public void force(boolean metaData) throws IOException {
         ensureOpen();
+        // C2: seal the open GCM block (write its ciphertext + tag) BEFORE forcing, so every byte that a
+        // subsequent checkpoint references — and any concurrent read of just-written ops — sees a complete,
+        // authenticated chunk on disk. Without this, the open block's tag lives only in memory and a
+        // realtime read / crash hits an un-tagged chunk -> AEADBadTagException.
+        positionLock.writeLock().lock();
+        try {
+            chunkManager.flushSeal();
+        } finally {
+            positionLock.writeLock().unlock();
+        }
         delegate.force(metaData);
     }
 
