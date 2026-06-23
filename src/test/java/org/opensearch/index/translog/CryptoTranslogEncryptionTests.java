@@ -545,6 +545,35 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * Realtime-GET of an UNCOMMITTED op (no force, no close): the open block lives only in memory (blockBuf).
+     * A read of that logical region through the SAME channel must return the bytes from the buffer — not 0,
+     * which would make core's read loop spin/hang. This is the no-force variant of the original
+     * AEADBadTagException repro and must be served without any decrypt failure.
+     */
+    public void testRealtimeReadOfUnsealedOpenBlock() throws IOException {
+        String uuid = "realtime-open-uuid";
+        Path path = tempDir.resolve("translog-11.tlog");
+        int len = 1500; // sub-block: stays buffered until force()/close()
+        byte[] data = randomByteArrayOfLength(len);
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        TranslogHeader h = new TranslogHeader(uuid, 1L);
+        h.write(ch, false);
+        int headerSize = h.sizeInBytes();
+        ch.write(ByteBuffer.wrap(data), headerSize);
+        // NO force(), NO close() — read the just-written (still-buffered) op back through the same channel.
+        byte[] back = readFullyLoop(ch, headerSize, len);
+        assertArrayEquals("realtime read of an unsealed op must return the buffered bytes", data, back);
+
+        // a partial read within the open block must also work (offset into blockBuf)
+        ByteBuffer mid = ByteBuffer.allocate(200);
+        int n = ch.read(mid, headerSize + 500);
+        assertTrue("read within open block must return >0", n > 0);
+        ch.close();
+    }
+
+    /**
      * C2 (the live AEADBadTagException repro, made deterministic and crash-free): write a sub-block amount
      * of data, force() WITHOUT closing the channel, then read it back through a fresh read-only channel.
      * This mirrors a realtime GET of an uncommitted op in the still-open block. Before seal-on-force, the

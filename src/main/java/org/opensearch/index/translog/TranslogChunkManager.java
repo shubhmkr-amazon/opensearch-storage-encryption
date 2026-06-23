@@ -195,17 +195,40 @@ public class TranslogChunkManager {
     //   blockDiskOffset[i] = byte offset of its u16 length prefix
     //   blockPlainOffset[i] = cumulative plaintext bytes before block i (logical offset of its first byte)
     //   blockPtLen[i] = plaintext length of block i
-    // Rebuilt lazily and whenever the on-disk size grows (a concurrent writer sealed more blocks).
-    private long[] blockDiskOffset = new long[0];
-    private long[] blockPlainOffset = new long[0];
-    private int[] blockPtLen = new int[0];
-    private int indexedBlockCount = 0;
-    private long indexedFileSize = -1;
+    /**
+     * Immutable snapshot of the sealed-block index, published atomically via a single volatile reference so
+     * concurrent readers never observe torn arrays. Built by scanning the length-prefixed records on disk.
+     */
+    private static final class BlockIndex {
+        final long[] diskOffset;   // byte offset of each block's u16 length prefix
+        final long[] plainOffset;  // cumulative plaintext bytes before each block (its first logical byte)
+        final int[] ptLen;         // plaintext length of each block
+        final int count;
+        final long indexedFileSize; // delegate.size() this index was built for
 
-    private void ensureIndex() throws IOException {
+        BlockIndex(long[] diskOffset, long[] plainOffset, int[] ptLen, long indexedFileSize) {
+            this.diskOffset = diskOffset;
+            this.plainOffset = plainOffset;
+            this.ptLen = ptLen;
+            this.count = diskOffset.length;
+            this.indexedFileSize = indexedFileSize;
+        }
+    }
+
+    private static final BlockIndex EMPTY_INDEX = new BlockIndex(new long[0], new long[0], new int[0], -1);
+    // Rebuilt lazily and whenever the on-disk size grows (a concurrent writer sealed more blocks).
+    private volatile BlockIndex blockIndex = EMPTY_INDEX;
+
+    /**
+     * Returns an up-to-date sealed-block index, rebuilding it if the on-disk size changed. The result is an
+     * immutable snapshot published via a single volatile write, so a concurrent reader sees either the old
+     * or the new index whole — never a torn mix of fields.
+     */
+    private BlockIndex currentIndex() throws IOException {
         long size = delegate.size();
-        if (size == indexedFileSize) {
-            return; // up to date
+        BlockIndex idx = blockIndex;
+        if (idx.indexedFileSize == size) {
+            return idx; // up to date
         }
         int headerSize = determineHeaderSize();
         java.util.ArrayList<Long> diskOffs = new java.util.ArrayList<>();
@@ -232,11 +255,14 @@ public class TranslogChunkManager {
             plain += ptLen;
             pos = recordEnd;
         }
-        blockDiskOffset = diskOffs.stream().mapToLong(Long::longValue).toArray();
-        blockPlainOffset = plainOffs.stream().mapToLong(Long::longValue).toArray();
-        blockPtLen = ptLens.stream().mapToInt(Integer::intValue).toArray();
-        indexedBlockCount = blockDiskOffset.length;
-        indexedFileSize = size;
+        BlockIndex rebuilt = new BlockIndex(
+            diskOffs.stream().mapToLong(Long::longValue).toArray(),
+            plainOffs.stream().mapToLong(Long::longValue).toArray(),
+            ptLens.stream().mapToInt(Integer::intValue).toArray(),
+            size
+        );
+        blockIndex = rebuilt; // single volatile publish
+        return rebuilt;
     }
 
     /**
@@ -248,17 +274,20 @@ public class TranslogChunkManager {
      * @throws IOException if the index cannot be built
      */
     public ChunkInfo getChunkInfo(long filePosition) throws IOException {
-        ensureIndex();
+        return getChunkInfo(filePosition, currentIndex());
+    }
+
+    private ChunkInfo getChunkInfo(long filePosition, BlockIndex idx) {
         long dataPosition = filePosition - determineHeaderSize();
-        if (indexedBlockCount == 0 || dataPosition < 0) {
+        if (idx.count == 0 || dataPosition < 0) {
             return new ChunkInfo(-1, 0, determineHeaderSize());
         }
         // binary search for the block whose plaintext range contains dataPosition
-        int lo = 0, hi = indexedBlockCount - 1, found = -1;
+        int lo = 0, hi = idx.count - 1, found = -1;
         while (lo <= hi) {
             int mid = (lo + hi) >>> 1;
-            long start = blockPlainOffset[mid];
-            long end = start + blockPtLen[mid];
+            long start = idx.plainOffset[mid];
+            long end = start + idx.ptLen[mid];
             if (dataPosition < start) {
                 hi = mid - 1;
             } else if (dataPosition >= end) {
@@ -271,8 +300,8 @@ public class TranslogChunkManager {
         if (found < 0) {
             return new ChunkInfo(-1, 0, determineHeaderSize());
         }
-        int offsetInChunk = (int) (dataPosition - blockPlainOffset[found]);
-        return new ChunkInfo(found, offsetInChunk, blockDiskOffset[found]);
+        int offsetInChunk = (int) (dataPosition - idx.plainOffset[found]);
+        return new ChunkInfo(found, offsetInChunk, idx.diskOffset[found]);
     }
 
     /**
@@ -284,13 +313,16 @@ public class TranslogChunkManager {
      * @throws IOException if reading or decryption fails
      */
     public byte[] readAndDecryptChunk(int chunkIndex) throws IOException {
+        return readAndDecryptChunk(chunkIndex, currentIndex());
+    }
+
+    private byte[] readAndDecryptChunk(int chunkIndex, BlockIndex idx) throws IOException {
         try {
-            ensureIndex();
-            if (chunkIndex < 0 || chunkIndex >= indexedBlockCount) {
+            if (chunkIndex < 0 || chunkIndex >= idx.count) {
                 return new byte[0];
             }
-            long recordPos = blockDiskOffset[chunkIndex];
-            int ptLen = blockPtLen[chunkIndex];
+            long recordPos = idx.diskOffset[chunkIndex];
+            int ptLen = idx.ptLen[chunkIndex];
             int ctWithTag = ptLen + GCM_TAG_SIZE;
 
             // skip the u16 length prefix, read ciphertext+tag fully
@@ -335,11 +367,30 @@ public class TranslogChunkManager {
             return readFully(dst, position);
         }
 
-        // Chunk-based reading for encrypted data
-        ChunkInfo chunkInfo = getChunkInfo(position);
+        long dataPosition = position - headerSize;
+
+        // Open-block read: the bytes between the last SEALED block and logicalDataWritten live only in the
+        // in-memory blockBuf (not yet sealed to disk). A realtime GET of an uncommitted op lands here — core
+        // does not fsync before such a read, so we must serve it from memory or core's read loop spins on a
+        // 0-byte return. The buffered region covers logical [sealedPlainBytes, logicalDataWritten).
+        long sealedPlainBytes = logicalDataWritten - blockBufLen;
+        if (blockBufLen > 0 && dataPosition >= sealedPlainBytes && dataPosition < logicalDataWritten) {
+            int offsetInBuf = (int) (dataPosition - sealedPlainBytes);
+            int available = blockBufLen - offsetInBuf;
+            int toRead = Math.min(dst.remaining(), available);
+            if (toRead > 0) {
+                dst.put(blockBuf, offsetInBuf, toRead);
+            }
+            return toRead;
+        }
+
+        // Sealed-block read: map the logical position to a sealed on-disk block and decrypt it. Build the
+        // index once and reuse it for both the lookup and the decrypt (avoids a double rebuild per read).
+        BlockIndex idx = currentIndex();
+        ChunkInfo chunkInfo = getChunkInfo(position, idx);
 
         // Read and decrypt the needed chunk
-        byte[] decryptedChunk = readAndDecryptChunk(chunkInfo.chunkIndex);
+        byte[] decryptedChunk = readAndDecryptChunk(chunkInfo.chunkIndex, idx);
 
         // Extract requested data from decrypted chunk
         int available = Math.max(0, decryptedChunk.length - chunkInfo.offsetInChunk);
