@@ -70,6 +70,9 @@ public class TranslogChunkManager {
     private static final int BLOCK_SIZE_SHIFT = 13;
     private static final int BLOCK_SIZE = 1 << BLOCK_SIZE_SHIFT; // 8KB blocks
     private long fileWritePosition = 0;
+    // Total plaintext bytes streamed so far (excludes inline tags). Used to enforce the append-only
+    // contract (M4): the next data write must arrive at exactly headerSize + logicalDataWritten.
+    private long logicalDataWritten = 0;
 
     /**
      * Helper class for chunk position mapping
@@ -369,7 +372,37 @@ public class TranslogChunkManager {
         }
 
         if (fileWritePosition == 0) {
+            // C6 guard: refuse to start appending to a NON-EMPTY encrypted translog. A fresh manager
+            // resets block numbering to 0; appending to an existing file would re-encrypt block 0 under a
+            // reused (key, nonce). Core only ever opens a brand-new generation for write (CREATE_NEW) and
+            // reopens existing generations read-only, so this never fires in practice — it fails closed if
+            // that ever changes, before any nonce reuse can occur.
+            if (delegate.size() != headerSize) {
+                throw new IOException(
+                    "refusing to append to a non-empty encrypted translog (size="
+                        + delegate.size()
+                        + ", headerSize="
+                        + headerSize
+                        + "): reopen-for-append would reuse a GCM nonce. file:"
+                        + filePath
+                );
+            }
             fileWritePosition = headerSize;
+        }
+
+        // M4: the encrypted translog is append-only. The data-write path always continues the stream at
+        // the internal logical cursor and derives nonces from the running block index; a positional write
+        // at a different offset would silently misplace bytes / reuse a nonce. Fail closed on mismatch.
+        long expectedLogicalPosition = headerSize + logicalDataWritten;
+        if (position != expectedLogicalPosition) {
+            throw new IOException(
+                "encrypted translog is append-only: write at position "
+                    + position
+                    + " but current logical write position is "
+                    + expectedLogicalPosition
+                    + " file:"
+                    + filePath
+            );
         }
 
         int totalWritten = 0;
@@ -408,6 +441,7 @@ public class TranslogChunkManager {
 
             currentBlockBytesWritten += toWrite;
             totalWritten += toWrite;
+            logicalDataWritten += toWrite;
         }
 
         return totalWritten;

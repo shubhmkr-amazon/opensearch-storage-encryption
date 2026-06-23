@@ -544,6 +544,53 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * M4: the encrypted translog is append-only. A data write whose position does not equal the current
+     * logical write cursor must fail closed rather than silently misplace bytes / reuse a nonce.
+     */
+    public void testNonAppendWriteRejected() throws IOException {
+        String uuid = "append-only-uuid";
+        Path path = tempDir.resolve("translog-3.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        byte[] first = randomByteArrayOfLength(4096);
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            // sequential append at the logical cursor: OK
+            assertEquals(first.length, ch.write(ByteBuffer.wrap(first), headerSize));
+            // append continues fine
+            byte[] more = randomByteArrayOfLength(1000);
+            assertEquals(more.length, ch.write(ByteBuffer.wrap(more), headerSize + first.length));
+            // a write at the WRONG (earlier) position must be rejected
+            IOException e = expectThrows(IOException.class, () -> ch.write(ByteBuffer.wrap(new byte[10]), headerSize));
+            assertTrue("expected append-only message, got: " + e.getMessage(), e.getMessage().contains("append-only"));
+        }
+    }
+
+    /**
+     * C6: reopening a non-empty encrypted translog for write must fail closed (reopen-for-append would
+     * reuse block-0's nonce). Core never does this (CREATE_NEW + read-only reopen); this is a safety net.
+     */
+    public void testReopenForAppendRejected() throws IOException {
+        String uuid = "reopen-guard-uuid";
+        Path path = tempDir.resolve("translog-9.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(randomByteArrayOfLength(TranslogChunkManager.GCM_CHUNK_SIZE)), headerSize);
+        }
+        // reopen the populated file for WRITE and attempt to append at headerSize
+        try (FileChannel ch = factory.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            IOException e = expectThrows(IOException.class, () -> ch.write(ByteBuffer.wrap(new byte[10]), headerSize));
+            assertTrue("expected non-empty-translog message, got: " + e.getMessage(), e.getMessage().contains("non-empty encrypted translog"));
+        }
+    }
+
+    /**
      * Intra-generation nonce regression: two blocks within the SAME file that hold identical plaintext
      * must encrypt to different ciphertext. Before the per-block nonce fix, every block in a file used
      * the same nonce baseIV[0:12] (the per-block "offset" only touched IV bytes 12-15, which GCM ignores),
