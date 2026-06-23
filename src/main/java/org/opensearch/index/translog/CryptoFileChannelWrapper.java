@@ -116,25 +116,33 @@ public class CryptoFileChannelWrapper extends FileChannel {
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
         ensureOpen();
 
-        long totalBytesRead = 0;
-        long currentPosition = position.get();
+        // L6: this scatter read mutates the channel position, so it must hold the same writeLock as the
+        // single-buffer stateful read — otherwise a concurrent read/write can tear the position. Call the
+        // unlocked readAtPosition() inside the lock (ReentrantReadWriteLock is not re-entrant write->read).
+        positionLock.writeLock().lock();
+        try {
+            long totalBytesRead = 0;
+            long currentPosition = position.get();
 
-        for (int i = offset; i < offset + length && i < dsts.length; i++) {
-            ByteBuffer dst = dsts[i];
-            if (dst.remaining() > 0) {
-                int bytesRead = read(dst, currentPosition + totalBytesRead);
-                if (bytesRead <= 0) {
-                    break;
+            for (int i = offset; i < offset + length && i < dsts.length; i++) {
+                ByteBuffer dst = dsts[i];
+                if (dst.remaining() > 0) {
+                    int bytesRead = readAtPosition(dst, currentPosition + totalBytesRead);
+                    if (bytesRead <= 0) {
+                        break;
+                    }
+                    totalBytesRead += bytesRead;
                 }
-                totalBytesRead += bytesRead;
             }
-        }
 
-        if (totalBytesRead > 0) {
-            position.addAndGet(totalBytesRead);
-        }
+            if (totalBytesRead > 0) {
+                position.addAndGet(totalBytesRead);
+            }
 
-        return totalBytesRead;
+            return totalBytesRead;
+        } finally {
+            positionLock.writeLock().unlock();
+        }
     }
 
     @Override
@@ -228,15 +236,27 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
         ensureOpen();
-        // Delegate to chunk manager for encrypted transfer
-        return chunkManager.transferFromChunks(position, count, target);
+        // L6: positional read of encrypted chunks — guard with the read lock so it cannot interleave with
+        // a concurrent write that is mutating the streaming-cipher state.
+        positionLock.readLock().lock();
+        try {
+            return chunkManager.transferFromChunks(position, count, target);
+        } finally {
+            positionLock.readLock().unlock();
+        }
     }
 
     @Override
     public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
         ensureOpen();
-        // Delegate to chunk manager for encrypted transfer
-        return chunkManager.transferToChunks(src, position, count);
+        // L6: mutates streaming-cipher write state (currentCipher/fileWritePosition/currentBlockNumber) —
+        // must hold the write lock, same as write().
+        positionLock.writeLock().lock();
+        try {
+            return chunkManager.transferToChunks(src, position, count);
+        } finally {
+            positionLock.writeLock().unlock();
+        }
     }
 
     @Override

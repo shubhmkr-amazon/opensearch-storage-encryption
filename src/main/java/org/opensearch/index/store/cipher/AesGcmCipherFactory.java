@@ -37,6 +37,41 @@ public class AesGcmCipherFactory {
      */
     public static final int GCM_TAG_LENGTH = 16;
 
+    /** GCM nonce length in bytes (96 bits, per NIST SP 800-38D). */
+    public static final int GCM_NONCE_LENGTH = 12;
+
+    /** Bytes of the base IV used as the per-file unique nonce prefix; the rest is the block counter. */
+    private static final int GCM_NONCE_PREFIX_LENGTH = 8;
+
+    /**
+     * Computes a unique 12-byte GCM nonce for a given chunk/block index.
+     *
+     * <p>Construction: {@code baseIV[0:8] || big-endian uint32(blockIndex)}.
+     * <ul>
+     *   <li>Bytes 0-7 come from the per-(file, generation) base IV (HKDF-derived) — unique per file.</li>
+     *   <li>Bytes 8-11 are the big-endian block index — unique per block within the file.</li>
+     * </ul>
+     *
+     * <p>This is the fix for intra-generation GCM nonce reuse: the previous code derived the cipher IV
+     * from only the base IV (the per-block "offset" was written into bytes 12-15 of a 16-byte IV, which
+     * AES-GCM discards — it uses only the first 12 bytes), so EVERY block in a generation was encrypted
+     * under the identical nonce {@code baseIV[0:12]} on distinct plaintext. Folding the block index into
+     * the 12-byte nonce makes each block's {@code (key, nonce)} pair unique.
+     *
+     * @param baseIV the per-file base IV (at least 8 bytes)
+     * @param blockIndex the zero-based block index within the file
+     * @return a 12-byte nonce unique per block
+     */
+    public static byte[] computeGcmNonce(byte[] baseIV, int blockIndex) {
+        byte[] nonce = new byte[GCM_NONCE_LENGTH];
+        System.arraycopy(baseIV, 0, nonce, 0, GCM_NONCE_PREFIX_LENGTH);
+        nonce[GCM_NONCE_PREFIX_LENGTH] = (byte) (blockIndex >>> 24);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 1] = (byte) (blockIndex >>> 16);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 2] = (byte) (blockIndex >>> 8);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 3] = (byte) blockIndex;
+        return nonce;
+    }
+
     /**
      * Returns a new Cipher instance configured for AES/GCM/NoPadding using the given provider.
      *

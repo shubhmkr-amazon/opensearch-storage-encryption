@@ -4,7 +4,6 @@
  */
 package org.opensearch.index.translog;
 
-import static org.opensearch.index.store.cipher.AesCipherFactory.computeOffsetIVForAesGcmEncrypted;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -266,8 +265,9 @@ public class TranslogChunkManager {
             // Use existing key management
             Key key = keyResolver.getDataKey();
 
-            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
-            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+            // Per-block 12-byte GCM nonce (baseIV[0:8] || BE32(chunkIndex)). MUST match the write path's
+            // nonce for the same block index, or decryption fails. See AesGcmCipherFactory.computeGcmNonce.
+            byte[] chunkIV = AesGcmCipherFactory.computeGcmNonce(baseIV, chunkIndex);
 
             // Use existing GCM decryption with authentication
             byte[] decrypted = AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
@@ -293,8 +293,8 @@ public class TranslogChunkManager {
             // Use existing key management
             Key key = keyResolver.getDataKey();
 
-            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
-            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+            // Per-block 12-byte GCM nonce (baseIV[0:8] || BE32(chunkIndex)) — unique per block.
+            byte[] chunkIV = AesGcmCipherFactory.computeGcmNonce(baseIV, chunkIndex);
 
             // Use existing GCM encryption (includes authentication tag)
             byte[] encryptedWithTag = AesGcmCipherFactory.encryptWithTag(key, chunkIV, plainData, plainData.length);
@@ -496,15 +496,27 @@ public class TranslogChunkManager {
      */
     private void initializeBlockCipher(long blockNumber) throws IOException {
         Key key = keyResolver.getDataKey();
-        long offset = blockNumber << BLOCK_SIZE_SHIFT;
+
+        // Per-block GCM nonce: baseIV[0:8] || BE32(blockNumber). blockNumber == the chunk index of the
+        // block (both count 8192-byte blocks from 0), so this matches readAndDecryptChunk's nonce exactly.
+        // Guard the 32-bit block-index domain (M3): beyond 2^31-1 blocks the nonce counter would alias.
+        if (blockNumber > Integer.MAX_VALUE) {
+            throw new IOException("translog block index " + blockNumber + " exceeds maximum addressable block for file:" + filePath);
+        }
+        byte[] nonce = AesGcmCipherFactory.computeGcmNonce(baseIV, (int) blockNumber);
+        // initGCMCipher requires a 16-byte IV but uses only the first 12 bytes (the GCM nonce); pad it.
+        byte[] iv16 = new byte[16];
+        System.arraycopy(nonce, 0, iv16, 0, nonce.length);
 
         try {
-            this.currentCipher = OpenSslNativeCipher.initGCMCipher(key.getEncoded(), baseIV, offset);
+            this.currentCipher = OpenSslNativeCipher.initGCMCipher(key.getEncoded(), iv16, 0L);
         } catch (Throwable e) {
             throw new IOException("Failed to initialize cipher for blockNumber:" + blockNumber + " for file:" + filePath, e);
         }
 
-        this.currentBlockNumber = blockNumber;
+        // NOTE: do NOT reassign currentBlockNumber here. The caller (writeToChunks) advances it via
+        // currentBlockNumber++ when selecting the block to initialize; reassigning it to blockNumber
+        // would undo that increment and pin every block to the same nonce index (GCM nonce reuse).
         this.currentBlockBytesWritten = 0;
     }
 

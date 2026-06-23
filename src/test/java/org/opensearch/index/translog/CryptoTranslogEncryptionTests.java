@@ -544,6 +544,48 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * Intra-generation nonce regression: two blocks within the SAME file that hold identical plaintext
+     * must encrypt to different ciphertext. Before the per-block nonce fix, every block in a file used
+     * the same nonce baseIV[0:12] (the per-block "offset" only touched IV bytes 12-15, which GCM ignores),
+     * so two equal 8192-byte plaintext blocks produced identical ciphertext — catastrophic GCM reuse
+     * within one translog file. Different ciphertext for equal blocks proves the nonce now varies per block.
+     */
+    public void testSameFileBlocksUseDistinctNonces() throws IOException {
+        String uuid = "intragen-nonce-uuid";
+        int chunk = TranslogChunkManager.GCM_CHUNK_SIZE;
+        // two identical full blocks back-to-back
+        byte[] block = randomByteArrayOfLength(chunk);
+        byte[] data = new byte[chunk * 2];
+        System.arraycopy(block, 0, data, 0, chunk);
+        System.arraycopy(block, 0, data, chunk, chunk);
+
+        Path path = tempDir.resolve("translog-7.tlog");
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader h = new TranslogHeader(uuid, 1L);
+            h.write(ch, false);
+            headerSize = h.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+
+        byte[] all = Files.readAllBytes(path);
+        // on-disk block 0 = [headerSize, headerSize+8208); block 1 = [headerSize+8208, headerSize+2*8208)
+        int stride = TranslogChunkManager.CHUNK_WITH_TAG_SIZE;
+        byte[] ct0 = java.util.Arrays.copyOfRange(all, headerSize, headerSize + stride);
+        byte[] ct1 = java.util.Arrays.copyOfRange(all, headerSize + stride, headerSize + 2 * stride);
+        assertFalse(
+            "two identical plaintext blocks in one file must NOT produce identical ciphertext (nonce reuse)",
+            java.util.Arrays.equals(ct0, ct1)
+        );
+
+        // and the file must still decrypt back to the original two identical blocks
+        try (FileChannel rc = factory.open(path, StandardOpenOption.READ)) {
+            assertArrayEquals(data, readFullyLoop(rc, headerSize, data.length));
+        }
+    }
+
+    /**
      * Edge case (READ-LOOP): symmetric read-side guard for the readFully loop. Writes a multi-chunk file
      * normally, then reads it back through a channel that returns at most 7 bytes per read. A reverted
      * readFully would feed a truncated chunk to GCM and throw "Failed to decrypt chunk N".
