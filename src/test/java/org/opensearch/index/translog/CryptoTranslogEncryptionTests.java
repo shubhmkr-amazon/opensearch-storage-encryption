@@ -9,6 +9,14 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.MappedByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -101,8 +109,8 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         // Create a mock key provider for testing
         keyProvider = new MasterKeyProvider() {
             @Override
-            public java.util.Map<String, String> getEncryptionContext() {
-                return java.util.Collections.singletonMap("test-key", "test-value");
+            public Map<String, String> getEncryptionContext() {
+                return Collections.singletonMap("test-key", "test-value");
             }
 
             @Override
@@ -289,7 +297,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
                     shortWriteChannel,
                     keyResolver,
                     translogPath,
-                    java.util.Set.of(StandardOpenOption.WRITE),
+                    Set.of(StandardOpenOption.WRITE),
                     testTranslogUUID
                 )
             ) {
@@ -376,7 +384,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
                     faulty,
                     keyResolver,
                     path,
-                    java.util.Set.of(StandardOpenOption.WRITE),
+                    Set.of(StandardOpenOption.WRITE),
                     uuid
                 )
             ) {
@@ -425,7 +433,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             try (FileChannel rc = factory.open(bp, StandardOpenOption.READ)) {
                 try {
                     byte[] got = readFullyLoop(rc, headerSize, len);
-                    assertFalse("GCM auth bypassed: tampered file decrypted to original", java.util.Arrays.equals(data, got));
+                    assertFalse("GCM auth bypassed: tampered file decrypted to original", Arrays.equals(data, got));
                 } catch (IOException e) {
                     assertTrue("unexpected error: " + e.getMessage(), e.getMessage().contains("Failed to decrypt chunk"));
                 } catch (AssertionError shortReadBack) {
@@ -448,7 +456,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
                     faulty,
                     keyResolver,
                     path,
-                    java.util.Set.of(StandardOpenOption.WRITE),
+                    Set.of(StandardOpenOption.WRITE),
                     uuid
                 )
             ) {
@@ -467,7 +475,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
      * (0, 1, around the 8192 chunk size, multi-chunk). Guards nonce/stride/finalize regressions.
      */
     public void testRoundTripLengthsAndBoundaries() throws IOException {
-        java.util.List<Integer> lengths = new java.util.ArrayList<>();
+        List<Integer> lengths = new ArrayList<>();
         for (int b : new int[] { 1, 100, 8191, 8192, 8193, 16384, 16385 }) {
             lengths.add(b);
         }
@@ -523,9 +531,9 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
                 }
                 // return the ciphertext region only (skip the plaintext header, which is identical anyway)
                 byte[] all = Files.readAllBytes(path);
-                return java.util.Arrays.copyOfRange(all, headerSize, all.length);
+                return Arrays.copyOfRange(all, headerSize, all.length);
             } catch (IOException e) {
-                throw new java.io.UncheckedIOException(e);
+                throw new UncheckedIOException(e);
             }
         };
 
@@ -534,7 +542,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
 
         assertFalse(
             "chunk-0 ciphertext must differ across generations (same nonce => GCM reuse)",
-            java.util.Arrays.equals(ctGen1, ctGen2)
+            Arrays.equals(ctGen1, ctGen2)
         );
 
         // and each generation must still decrypt back to the original through its own filename
@@ -732,11 +740,11 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         // [u16 len][8192 ct][16 tag] = LENGTH_PREFIX_SIZE + 8192 + 16 bytes.
         int dataStart = headerSize + TranslogChunkManager.SUPER_HEADER_SIZE;
         int stride = TranslogChunkManager.LENGTH_PREFIX_SIZE + TranslogChunkManager.GCM_CHUNK_SIZE + TranslogChunkManager.GCM_TAG_SIZE;
-        byte[] ct0 = java.util.Arrays.copyOfRange(all, dataStart, dataStart + stride);
-        byte[] ct1 = java.util.Arrays.copyOfRange(all, dataStart + stride, dataStart + 2 * stride);
+        byte[] ct0 = Arrays.copyOfRange(all, dataStart, dataStart + stride);
+        byte[] ct1 = Arrays.copyOfRange(all, dataStart + stride, dataStart + 2 * stride);
         assertFalse(
             "two identical plaintext blocks in one file must NOT produce identical ciphertext (nonce reuse)",
-            java.util.Arrays.equals(ct0, ct1)
+            Arrays.equals(ct0, ct1)
         );
 
         // and the file must still decrypt back to the original two identical blocks
@@ -769,7 +777,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         try (FileChannel real = FileChannel.open(path, StandardOpenOption.READ)) {
             FileChannel shortReads = new ShortWriteFileChannel(real, Integer.MAX_VALUE, 7);
             try (
-                FileChannel ch = new CryptoFileChannelWrapper(shortReads, keyResolver, path, java.util.Set.of(StandardOpenOption.READ), uuid)
+                FileChannel ch = new CryptoFileChannelWrapper(shortReads, keyResolver, path, Set.of(StandardOpenOption.READ), uuid)
             ) {
                 ByteBuffer hdr = ByteBuffer.allocate(headerSize);
                 int hpos = 0;
@@ -1037,7 +1045,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         }
 
         @Override
-        public java.nio.MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
+        public MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
             return delegate.map(mode, position, size);
         }
 

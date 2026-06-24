@@ -9,6 +9,8 @@ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.is;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -154,8 +156,8 @@ public class CryptoTranslogRecoveryIntegTests extends CryptoDirectoryIntegTestCa
     }
 
     /** Locate the translog directories of the index's shards via the live IndexShard's ShardPath. */
-    private java.util.List<Path> translogDirs(String index) {
-        java.util.List<Path> dirs = new java.util.ArrayList<>();
+    private List<Path> translogDirs(String index) {
+        List<Path> dirs = new ArrayList<>();
         String uuid = client()
             .admin()
             .cluster()
