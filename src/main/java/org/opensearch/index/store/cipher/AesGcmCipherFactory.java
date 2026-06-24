@@ -290,58 +290,6 @@ public class AesGcmCipherFactory {
     }
 
     /**
-     * Initialize GCM cipher for translog block encryption at given offset.
-     * Generates unique IV based on offset and initializes cipher for encryption.
-     *
-     * @param key The encryption key
-     * @param baseIV The base IV from KeyResolver
-     * @param offset The byte offset (e.g., blockNumber * BLOCK_SIZE)
-    FHeader should contain translog UUID     * @return Initialized GCM cipher ready for streaming encryption
-     */
-    public static Cipher initializeGCMCipher(Key key, byte[] baseIV, long offset) {
-        // Generate unique IV for this offset (16 bytes)
-        byte[] uniqueIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(baseIV, offset);
-
-        // Extract first 12 bytes for GCM
-        byte[] gcmIV = new byte[12];
-        System.arraycopy(uniqueIV, 0, gcmIV, 0, 12);
-
-        // Get cipher instance
-        Cipher cipher = getCipher();
-
-        // Initialize for encryption
-        initCipher(cipher, key, gcmIV, Cipher.ENCRYPT_MODE, offset);
-
-        return cipher;
-    }
-
-    /**
-     * Finalize GCM cipher and write authentication tag to FileChannel.
-     * For translog blocks where tags are written inline after encrypted data.
-     *
-     * @param cipher The GCM cipher to finalize
-     * @param channel The FileChannel to write the tag
-     * @throws java.io.IOException If finalization or writing fails
-     */
-    public static void finalizeCipherAndWriteTag(Cipher cipher, java.nio.channels.FileChannel channel) throws java.io.IOException {
-        if (cipher == null) {
-            throw new IllegalArgumentException("Cipher cannot be null");
-        }
-
-        try {
-            // Finalize cipher - returns any remaining encrypted data + 16-byte tag
-            byte[] finalData = finalizeAndGetTag(cipher);
-
-            // Write to channel
-            if (finalData.length > 0) {
-                channel.write(java.nio.ByteBuffer.wrap(finalData));
-            }
-        } catch (JavaCryptoException e) {
-            throw new java.io.IOException("Failed to finalize cipher and write tag", e);
-        }
-    }
-
-    /**
      * Custom exception for Java crypto-related errors in GCM operations.
      */
     public static class JavaCryptoException extends RuntimeException {

@@ -22,11 +22,24 @@ import org.opensearch.index.store.key.HkdfKeyDerivation;
 import org.opensearch.index.store.key.KeyResolver;
 
 /**
- * Manages 8KB encrypted chunks for translog files using AES-GCM authentication.
- * Handles chunk positioning, encryption, decryption, and I/O operations.
+ * Manages AES-GCM encryption of translog data as a sequence of self-describing blocks.
  *
- * This class separates chunking logic from FileChannel delegation, making the code
- * more maintainable and testable.
+ * <p>On-disk layout of a {@code .tlog} written by this class:
+ * <pre>
+ *   [ plaintext TranslogHeader ]            written by OpenSearch core
+ *   [ 4-byte plaintext TLE super-header ]   magic 'T','L','E' + format version
+ *   [ block 0 ] [ block 1 ] ... [ block N ] each: [u16 ptLen][ciphertext(ptLen)][16B GCM tag]
+ * </pre>
+ *
+ * <p>The writer buffers one block's plaintext in memory and SEALS it (one-shot GCM encrypt + write the
+ * length-prefixed record) when the block fills, on {@code force()}, or on {@code close()} — so every
+ * fsync/checkpoint is backed by complete, authenticated chunks (durability). Each block uses a distinct
+ * GCM nonce {@code baseIV[0:8] || BE32(blockIndex)} with a per-(generation) base IV. The reader scans the
+ * length prefixes into an immutable block index and serves logical reads (incl. from the open, unsealed
+ * block for realtime reads of uncommitted ops).
+ *
+ * <p>This class separates chunking logic from FileChannel delegation, making the code more maintainable
+ * and testable. "block" and "chunk" are used interchangeably (one block == one chunk).
  *
  * @opensearch.internal
  */
@@ -34,17 +47,14 @@ import org.opensearch.index.store.key.KeyResolver;
 @SuppressWarnings("preview")
 public class TranslogChunkManager {
 
-    // GCM chunk constants
-    /** Size of each data chunk in bytes (8KB). */
+    // GCM block constants ("block" and "chunk" are used interchangeably here: one block == one chunk).
+    /** Maximum plaintext bytes per block (8KB). The final block of a generation may be shorter. */
     public static final int GCM_CHUNK_SIZE = 8192;
 
-    /** Size of GCM authentication tag in bytes (16 bytes). */
+    /** Size of the GCM authentication tag in bytes (16 bytes). */
     public static final int GCM_TAG_SIZE = AesGcmCipherFactory.GCM_TAG_LENGTH;
 
-    /** Total size of chunk plus authentication tag in bytes (8208 bytes maximum). */
-    public static final int CHUNK_WITH_TAG_SIZE = GCM_CHUNK_SIZE + GCM_TAG_SIZE;
-
-    // Thread-local buffer pool for reducing allocations
+    // Thread-local buffer pool for reducing allocations on the transfer path.
     private static final ThreadLocal<ByteBuffer> TRANSFER_BUFFER_POOL = ThreadLocal.withInitial(() -> ByteBuffer.allocate(GCM_CHUNK_SIZE));
 
     private final FileChannel delegate;
@@ -205,24 +215,30 @@ public class TranslogChunkManager {
         final int[] ptLen;         // plaintext length of each block
         final int count;
         final long indexedFileSize; // delegate.size() this index was built for
+        final long scanResumePos;   // disk offset where the next (not-yet-sealed) record would start
+        final long scannedPlain;    // cumulative plaintext bytes covered by the indexed blocks
 
-        BlockIndex(long[] diskOffset, long[] plainOffset, int[] ptLen, long indexedFileSize) {
+        BlockIndex(long[] diskOffset, long[] plainOffset, int[] ptLen, long indexedFileSize, long scanResumePos, long scannedPlain) {
             this.diskOffset = diskOffset;
             this.plainOffset = plainOffset;
             this.ptLen = ptLen;
             this.count = diskOffset.length;
             this.indexedFileSize = indexedFileSize;
+            this.scanResumePos = scanResumePos;
+            this.scannedPlain = scannedPlain;
         }
     }
 
-    private static final BlockIndex EMPTY_INDEX = new BlockIndex(new long[0], new long[0], new int[0], -1);
-    // Rebuilt lazily and whenever the on-disk size grows (a concurrent writer sealed more blocks).
+    private static final BlockIndex EMPTY_INDEX = new BlockIndex(new long[0], new long[0], new int[0], -1, -1, 0);
+    // Rebuilt incrementally as the on-disk size grows (a concurrent/continuing writer seals more blocks).
     private volatile BlockIndex blockIndex = EMPTY_INDEX;
 
     /**
-     * Returns an up-to-date sealed-block index, rebuilding it if the on-disk size changed. The result is an
-     * immutable snapshot published via a single volatile write, so a concurrent reader sees either the old
-     * or the new index whole — never a torn mix of fields.
+     * Returns an up-to-date sealed-block index. Because the format is append-only and sealed blocks are
+     * never rewritten, this scans ONLY the newly-appended records (resuming from the previous index's
+     * scanResumePos) rather than rescanning the whole file — O(new blocks) per read, not O(N). The result
+     * is an immutable snapshot published via a single volatile write, so a concurrent reader sees either
+     * the old or the new index whole — never a torn mix of fields.
      */
     private BlockIndex currentIndex() throws IOException {
         long size = delegate.size();
@@ -231,11 +247,18 @@ public class TranslogChunkManager {
             return idx; // up to date
         }
         int headerSize = determineHeaderSize();
+        // Resume from where the last scan stopped (append-only => prior blocks are immutable).
+        long pos = idx.scanResumePos >= 0 ? idx.scanResumePos : headerSize;
+        long plain = idx.scannedPlain;
         java.util.ArrayList<Long> diskOffs = new java.util.ArrayList<>();
         java.util.ArrayList<Long> plainOffs = new java.util.ArrayList<>();
         java.util.ArrayList<Integer> ptLens = new java.util.ArrayList<>();
-        long pos = headerSize;
-        long plain = 0;
+        // seed with the already-indexed blocks
+        for (int i = 0; i < idx.count; i++) {
+            diskOffs.add(idx.diskOffset[i]);
+            plainOffs.add(idx.plainOffset[i]);
+            ptLens.add(idx.ptLen[i]);
+        }
         ByteBuffer lenBuf = ByteBuffer.allocate(LENGTH_PREFIX_SIZE);
         while (pos + LENGTH_PREFIX_SIZE <= size) {
             lenBuf.clear();
@@ -259,7 +282,9 @@ public class TranslogChunkManager {
             diskOffs.stream().mapToLong(Long::longValue).toArray(),
             plainOffs.stream().mapToLong(Long::longValue).toArray(),
             ptLens.stream().mapToInt(Integer::intValue).toArray(),
-            size
+            size,
+            pos,
+            plain
         );
         blockIndex = rebuilt; // single volatile publish
         return rebuilt;
