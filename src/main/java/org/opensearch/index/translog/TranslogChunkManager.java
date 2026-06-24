@@ -14,6 +14,8 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.Key;
+import java.util.ArrayList;
+import java.util.Arrays;
 
 import org.apache.lucene.codecs.CodecUtil;
 import org.opensearch.common.SuppressForbidden;
@@ -77,6 +79,15 @@ public class TranslogChunkManager {
     private static final int BLOCK_SIZE_SHIFT = 13;
     private static final int BLOCK_SIZE = 1 << BLOCK_SIZE_SHIFT; // 8KB max plaintext per block
 
+    // ---- Encryption-layer super-header (written once after the core TranslogHeader, before the blocks) ----
+    // Makes the on-disk encryption format self-describing so it can evolve (algorithm/chunk-size/nonce
+    // scheme/KDF) without another silent on-disk break: the reader dispatches on (magic, version).
+    private static final byte[] SUPER_HEADER_MAGIC = { 'T', 'L', 'E' };
+    /** Current encryption-layer format version: variable-length seal-on-force blocks. */
+    public static final byte FORMAT_VERSION = 2;
+    /** Size of the plaintext super-header: 3-byte magic + 1-byte version. */
+    public static final int SUPER_HEADER_SIZE = SUPER_HEADER_MAGIC.length + 1;
+
     // Write-side state
     private final byte[] blockBuf = new byte[BLOCK_SIZE]; // accumulates the open (unsealed) block's plaintext
     private int blockBufLen = 0;                          // bytes currently buffered in the open block
@@ -84,6 +95,7 @@ public class TranslogChunkManager {
     private long fileWritePosition = 0;                   // disk write cursor (after the last sealed block)
     // Total plaintext bytes accepted so far (sealed + buffered). Enforces append-only (M4).
     private long logicalDataWritten = 0;
+    private boolean superHeaderWritten = false;           // whether this writer has emitted the super-header
 
     /**
      * Helper class for chunk position mapping
@@ -150,6 +162,62 @@ public class TranslogChunkManager {
      */
     public int determineHeaderSize() {
         return actualHeaderSize;
+    }
+
+    /**
+     * Disk offset where the encrypted block stream begins: after the core TranslogHeader and the
+     * encryption-layer super-header. Block records are written/read from here; the core header region
+     * [0, headerSize) is still served as plaintext passthrough.
+     *
+     * @return the disk offset of the first block record
+     */
+    private long dataStartOffset() {
+        return (long) actualHeaderSize + SUPER_HEADER_SIZE;
+    }
+
+    /**
+     * Writes the 3-byte magic + 1-byte version super-header at {@code actualHeaderSize}. Called once, on
+     * the first data write to a fresh translog, before any block. Idempotent within a writer's lifetime
+     * (guarded by {@code superHeaderWritten}).
+     */
+    private void writeSuperHeader() throws IOException {
+        ByteBuffer sh = ByteBuffer.allocate(SUPER_HEADER_SIZE);
+        sh.put(SUPER_HEADER_MAGIC);
+        sh.put(FORMAT_VERSION);
+        sh.flip();
+        writeFully(sh, actualHeaderSize);
+    }
+
+    /**
+     * Reads and validates the super-header. Fail-closed: a missing/wrong magic or unknown version means
+     * this is not a v2 encrypted translog (or a future format), so we refuse rather than misparse.
+     *
+     * @return true if a valid current-version super-header is present; false if the region is absent
+     *         (e.g. a header-only file with no data yet)
+     * @throws IOException if the magic is present but malformed/unsupported, or on a read error
+     */
+    private boolean verifySuperHeader() throws IOException {
+        if (delegate.size() < dataStartOffset()) {
+            return false; // no super-header yet (header-only / empty data region)
+        }
+        ByteBuffer sh = ByteBuffer.allocate(SUPER_HEADER_SIZE);
+        int n = readFully(sh, actualHeaderSize);
+        if (n < SUPER_HEADER_SIZE) {
+            return false;
+        }
+        sh.flip();
+        byte[] magic = new byte[SUPER_HEADER_MAGIC.length];
+        sh.get(magic);
+        byte version = sh.get();
+        if (!Arrays.equals(magic, SUPER_HEADER_MAGIC)) {
+            throw new IOException("not a TLE-encrypted translog (bad super-header magic) file:" + filePath);
+        }
+        if (version != FORMAT_VERSION) {
+            throw new IOException(
+                "unsupported encrypted translog format version " + version + " (expected " + FORMAT_VERSION + ") file:" + filePath
+            );
+        }
+        return true;
     }
 
     /**
@@ -246,13 +314,20 @@ public class TranslogChunkManager {
         if (idx.indexedFileSize == size) {
             return idx; // up to date
         }
-        int headerSize = determineHeaderSize();
-        // Resume from where the last scan stopped (append-only => prior blocks are immutable).
-        long pos = idx.scanResumePos >= 0 ? idx.scanResumePos : headerSize;
+        // Validate the self-describing super-header before trusting any block bytes (fail-closed on a
+        // foreign/old/future format). Absent super-header => no data yet => empty index.
+        if (!verifySuperHeader()) {
+            BlockIndex empty = new BlockIndex(new long[0], new long[0], new int[0], size, dataStartOffset(), 0);
+            blockIndex = empty;
+            return empty;
+        }
+        // Resume from where the last scan stopped (append-only => prior blocks are immutable); the first
+        // block starts right after the super-header.
+        long pos = idx.scanResumePos >= 0 ? idx.scanResumePos : dataStartOffset();
         long plain = idx.scannedPlain;
-        java.util.ArrayList<Long> diskOffs = new java.util.ArrayList<>();
-        java.util.ArrayList<Long> plainOffs = new java.util.ArrayList<>();
-        java.util.ArrayList<Integer> ptLens = new java.util.ArrayList<>();
+        ArrayList<Long> diskOffs = new ArrayList<>();
+        ArrayList<Long> plainOffs = new ArrayList<>();
+        ArrayList<Integer> ptLens = new ArrayList<>();
         // seed with the already-indexed blocks
         for (int i = 0; i < idx.count; i++) {
             diskOffs.add(idx.diskOffset[i]);
@@ -449,12 +524,13 @@ public class TranslogChunkManager {
             return writeFully(src, position);
         }
 
-        if (fileWritePosition == 0) {
+        if (!superHeaderWritten) {
             // C6 guard: refuse to start appending to a NON-EMPTY encrypted translog. A fresh manager
             // resets block numbering to 0; appending to an existing file would re-encrypt block 0 under a
             // reused (key, nonce). Core only ever opens a brand-new generation for write (CREATE_NEW) and
             // reopens existing generations read-only, so this never fires in practice — it fails closed if
-            // that ever changes, before any nonce reuse can occur.
+            // that ever changes, before any nonce reuse can occur. A fresh translog has only the core
+            // header on disk (no super-header, no blocks yet).
             if (delegate.size() != headerSize) {
                 throw new IOException(
                     "refusing to append to a non-empty encrypted translog (size="
@@ -465,7 +541,10 @@ public class TranslogChunkManager {
                         + filePath
                 );
             }
-            fileWritePosition = headerSize;
+            // Emit the self-describing encryption super-header before the first block.
+            writeSuperHeader();
+            superHeaderWritten = true;
+            fileWritePosition = dataStartOffset();
         }
 
         // M4: the encrypted translog is append-only. The data-write path always continues the stream at

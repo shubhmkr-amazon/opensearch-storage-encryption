@@ -348,9 +348,12 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
      * {@code len + (LENGTH_PREFIX_SIZE + 16) * numBlocks}, where numBlocks = ceil(len / 8192).
      */
     private static long expectedFileSize(int headerSize, int len) {
+        if (len == 0) {
+            return headerSize; // no data written => no super-header, no blocks
+        }
         int blocks = (len + TranslogChunkManager.GCM_CHUNK_SIZE - 1) / TranslogChunkManager.GCM_CHUNK_SIZE;
         long perBlockOverhead = TranslogChunkManager.LENGTH_PREFIX_SIZE + TranslogChunkManager.GCM_TAG_SIZE;
-        return headerSize + (long) len + (long) blocks * perBlockOverhead;
+        return headerSize + TranslogChunkManager.SUPER_HEADER_SIZE + (long) len + (long) blocks * perBlockOverhead;
     }
 
     /**
@@ -545,6 +548,54 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     }
 
     /**
+     * Format-version super-header: a v2 file carries a 'TLE'+version super-header right after the core
+     * header, and the reader fails closed on a wrong/foreign magic or an unsupported version (so a future
+     * format or a non-TLE file can never be silently misparsed as v2).
+     */
+    public void testSuperHeaderPresentAndVersionEnforced() throws IOException {
+        String uuid = "superheader-uuid";
+        Path path = tempDir.resolve("translog-13.tlog");
+        byte[] data = randomByteArrayOfLength(2000);
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyResolver, uuid);
+
+        int headerSize;
+        try (FileChannel ch = factory.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            TranslogHeader hh = new TranslogHeader(uuid, 1L);
+            hh.write(ch, false);
+            headerSize = hh.sizeInBytes();
+            ch.write(ByteBuffer.wrap(data), headerSize);
+        }
+
+        // The 4 bytes after the core header are the plaintext super-header: 'T','L','E', version.
+        byte[] all = Files.readAllBytes(path);
+        assertEquals('T', all[headerSize]);
+        assertEquals('L', all[headerSize + 1]);
+        assertEquals('E', all[headerSize + 2]);
+        assertEquals(TranslogChunkManager.FORMAT_VERSION, all[headerSize + 3]);
+
+        // Corrupt the version byte to an unsupported value -> reader must fail closed, not misparse.
+        // Keep the translog-<gen>.tlog name so the manager computes the right header size / generation.
+        byte[] badVersion = all.clone();
+        badVersion[headerSize + 3] = (byte) 0x7F;
+        Path badV = tempDir.resolve("translog-1300.tlog");
+        Files.write(badV, badVersion);
+        try (FileChannel rc = factory.open(badV, StandardOpenOption.READ)) {
+            IOException e = expectThrows(IOException.class, () -> readFullyLoop(rc, headerSize, data.length));
+            assertTrue("expected version/format error, got: " + e.getMessage(), e.getMessage().contains("format version"));
+        }
+
+        // Corrupt the magic -> reader must fail closed.
+        byte[] badMagic = all.clone();
+        badMagic[headerSize] = 'X';
+        Path badM = tempDir.resolve("translog-1301.tlog");
+        Files.write(badM, badMagic);
+        try (FileChannel rc = factory.open(badM, StandardOpenOption.READ)) {
+            IOException e = expectThrows(IOException.class, () -> readFullyLoop(rc, headerSize, data.length));
+            assertTrue("expected magic error, got: " + e.getMessage(), e.getMessage().contains("super-header magic"));
+        }
+    }
+
+    /**
      * Realtime-GET of an UNCOMMITTED op (no force, no close): the open block lives only in memory (blockBuf).
      * A read of that logical region through the SAME channel must return the bytes from the buffer — not 0,
      * which would make core's read loop spin/hang. This is the no-force variant of the original
@@ -677,10 +728,12 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         }
 
         byte[] all = Files.readAllBytes(path);
-        // v2: each full block is [u16 len][8192 ct][16 tag] = LENGTH_PREFIX_SIZE + 8192 + 16 bytes.
+        // v2: blocks start after the core header + the SUPER_HEADER; each full block is
+        // [u16 len][8192 ct][16 tag] = LENGTH_PREFIX_SIZE + 8192 + 16 bytes.
+        int dataStart = headerSize + TranslogChunkManager.SUPER_HEADER_SIZE;
         int stride = TranslogChunkManager.LENGTH_PREFIX_SIZE + TranslogChunkManager.GCM_CHUNK_SIZE + TranslogChunkManager.GCM_TAG_SIZE;
-        byte[] ct0 = java.util.Arrays.copyOfRange(all, headerSize, headerSize + stride);
-        byte[] ct1 = java.util.Arrays.copyOfRange(all, headerSize + stride, headerSize + 2 * stride);
+        byte[] ct0 = java.util.Arrays.copyOfRange(all, dataStart, dataStart + stride);
+        byte[] ct1 = java.util.Arrays.copyOfRange(all, dataStart + stride, dataStart + 2 * stride);
         assertFalse(
             "two identical plaintext blocks in one file must NOT produce identical ciphertext (nonce reuse)",
             java.util.Arrays.equals(ct0, ct1)
