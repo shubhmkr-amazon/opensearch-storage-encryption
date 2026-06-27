@@ -37,38 +37,28 @@ public class AesGcmCipherFactory {
      */
     public static final int GCM_TAG_LENGTH = 16;
 
-    /** GCM nonce length in bytes (96 bits, per NIST SP 800-38D). */
+    /**
+     * GCM nonce length in bytes (96 bits per NIST SP 800-38D).
+     */
     public static final int GCM_NONCE_LENGTH = 12;
 
-    /** Bytes of the base IV used as the per-file unique nonce prefix; the rest is the block counter. */
     private static final int GCM_NONCE_PREFIX_LENGTH = 8;
 
     /**
-     * Computes a unique 12-byte GCM nonce for a given chunk/block index.
+     * Computes a 12-byte GCM nonce for a given chunk index.
+     * Construction: baseIV[0:8] || big-endian(chunkIndex)
      *
-     * <p>Construction: {@code baseIV[0:8] || big-endian uint32(blockIndex)}.
-     * <ul>
-     *   <li>Bytes 0-7 come from the per-(file, generation) base IV (HKDF-derived) — unique per file.</li>
-     *   <li>Bytes 8-11 are the big-endian block index — unique per block within the file.</li>
-     * </ul>
-     *
-     * <p>This is the fix for intra-generation GCM nonce reuse: the previous code derived the cipher IV
-     * from only the base IV (the per-block "offset" was written into bytes 12-15 of a 16-byte IV, which
-     * AES-GCM discards — it uses only the first 12 bytes), so EVERY block in a generation was encrypted
-     * under the identical nonce {@code baseIV[0:12]} on distinct plaintext. Folding the block index into
-     * the 12-byte nonce makes each block's {@code (key, nonce)} pair unique.
-     *
-     * @param baseIV the per-file base IV (at least 8 bytes)
-     * @param blockIndex the zero-based block index within the file
-     * @return a 12-byte nonce unique per block
+     * @param baseIV The base IV (at least 8 bytes) derived from the data key
+     * @param chunkIndex The chunk index (0-based)
+     * @return A 12-byte nonce unique per chunk
      */
-    public static byte[] computeGcmNonce(byte[] baseIV, int blockIndex) {
+    public static byte[] computeGcmNonce(byte[] baseIV, int chunkIndex) {
         byte[] nonce = new byte[GCM_NONCE_LENGTH];
         System.arraycopy(baseIV, 0, nonce, 0, GCM_NONCE_PREFIX_LENGTH);
-        nonce[GCM_NONCE_PREFIX_LENGTH] = (byte) (blockIndex >>> 24);
-        nonce[GCM_NONCE_PREFIX_LENGTH + 1] = (byte) (blockIndex >>> 16);
-        nonce[GCM_NONCE_PREFIX_LENGTH + 2] = (byte) (blockIndex >>> 8);
-        nonce[GCM_NONCE_PREFIX_LENGTH + 3] = (byte) blockIndex;
+        nonce[GCM_NONCE_PREFIX_LENGTH] = (byte) (chunkIndex >>> 24);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 1] = (byte) (chunkIndex >>> 16);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 2] = (byte) (chunkIndex >>> 8);
+        nonce[GCM_NONCE_PREFIX_LENGTH + 3] = (byte) chunkIndex;
         return nonce;
     }
 
@@ -226,6 +216,88 @@ public class AesGcmCipherFactory {
     }
 
     /**
+     * Encrypts data with GCM, binding {@code aad} as Additional Authenticated Data, and returns the
+     * ciphertext with the 16-byte authentication tag appended.
+     *
+     * <p>The AAD is authenticated (its integrity is covered by the GCM tag) but NOT encrypted — it is not
+     * part of the returned ciphertext. The SAME {@code aad} bytes MUST be supplied to
+     * {@link #decryptWithTag(Key, byte[], byte[], byte[])} or authentication fails. This is the translog
+     * primitive: the frame metadata (length, logical offset, frame sequence, key epoch, file context) is
+     * bound here so any tamper of that metadata is detected as a tag mismatch.
+     *
+     * @param key    The AES-256 key
+     * @param iv     The initialization vector (first 12 bytes used as the GCM nonce)
+     * @param input  Input data to encrypt
+     * @param length Length of {@code input} to encrypt
+     * @param aad    Additional Authenticated Data to bind (may be null/empty for no AAD)
+     * @return Encrypted data with 16-byte authentication tag appended
+     * @throws JavaCryptoException If encryption fails
+     */
+    public static byte[] encryptWithTag(Key key, byte[] iv, byte[] input, int length, byte[] aad) throws JavaCryptoException {
+        if (input == null || length <= 0) {
+            throw new IllegalArgumentException("Input cannot be null and length must be positive");
+        }
+        if (length > input.length) {
+            throw new IllegalArgumentException("Length cannot exceed input array size");
+        }
+
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            byte[] gcmIv = new byte[12];
+            System.arraycopy(iv, 0, gcmIv, 0, 12);
+            GCMParameterSpec spec = new GCMParameterSpec(128, gcmIv);
+            cipher.init(Cipher.ENCRYPT_MODE, key, spec);
+
+            // AAD MUST be applied before doFinal, and symmetrically on decrypt (see decryptWithTag overload).
+            if (aad != null && aad.length > 0) {
+                cipher.updateAAD(aad);
+            }
+
+            return cipher.doFinal(input, 0, length);
+        } catch (Exception e) {
+            throw new JavaCryptoException("GCM encryption with tag (AAD) failed", e);
+        }
+    }
+
+    /**
+     * Decrypts GCM data, verifying both the authentication tag and the {@code aad} binding.
+     *
+     * <p>{@code aad} MUST be byte-for-byte identical to the value passed to
+     * {@link #encryptWithTag(Key, byte[], byte[], int, byte[])}; otherwise {@code doFinal} throws and we
+     * surface a {@link JavaCryptoException} (fail-closed). Any tamper of the authenticated metadata — not
+     * just the ciphertext — is therefore detected here.
+     *
+     * @param key        The AES-256 key
+     * @param iv         The initialization vector (first 12 bytes used as the GCM nonce)
+     * @param ciphertext Encrypted data with authentication tag appended
+     * @param aad        Additional Authenticated Data that was bound at encryption (may be null/empty)
+     * @return Decrypted plaintext data
+     * @throws JavaCryptoException If decryption, tag verification, or AAD verification fails
+     */
+    public static byte[] decryptWithTag(Key key, byte[] iv, byte[] ciphertext, byte[] aad) throws JavaCryptoException {
+        if (ciphertext == null || ciphertext.length < GCM_TAG_LENGTH) {
+            throw new IllegalArgumentException("Ciphertext must be at least " + GCM_TAG_LENGTH + " bytes");
+        }
+
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            byte[] gcmIv = new byte[12];
+            System.arraycopy(iv, 0, gcmIv, 0, 12);
+            GCMParameterSpec spec = new GCMParameterSpec(128, gcmIv);
+            cipher.init(Cipher.DECRYPT_MODE, key, spec);
+
+            // Symmetric with the encrypt path: same AAD applied before doFinal, else authentication fails.
+            if (aad != null && aad.length > 0) {
+                cipher.updateAAD(aad);
+            }
+
+            return cipher.doFinal(ciphertext);
+        } catch (Exception e) {
+            throw new JavaCryptoException("GCM decryption with tag+AAD verification failed", e);
+        }
+    }
+
+    /**
      * Initializes a frame cipher for encryption with frame-specific IV.
      *
      * @param algorithm The encryption algorithm
@@ -286,6 +358,58 @@ public class AesGcmCipherFactory {
             }
         } catch (Throwable t) {
             throw new java.io.IOException("Failed to finalize frame " + frameNumber, t);
+        }
+    }
+
+    /**
+     * Initialize GCM cipher for translog block encryption at given offset.
+     * Generates unique IV based on offset and initializes cipher for encryption.
+     *
+     * @param key The encryption key
+     * @param baseIV The base IV from KeyResolver
+     * @param offset The byte offset (e.g., blockNumber * BLOCK_SIZE)
+    FHeader should contain translog UUID     * @return Initialized GCM cipher ready for streaming encryption
+     */
+    public static Cipher initializeGCMCipher(Key key, byte[] baseIV, long offset) {
+        // Generate unique IV for this offset (16 bytes)
+        byte[] uniqueIV = AesCipherFactory.computeOffsetIVForAesGcmEncrypted(baseIV, offset);
+
+        // Extract first 12 bytes for GCM
+        byte[] gcmIV = new byte[12];
+        System.arraycopy(uniqueIV, 0, gcmIV, 0, 12);
+
+        // Get cipher instance
+        Cipher cipher = getCipher();
+
+        // Initialize for encryption
+        initCipher(cipher, key, gcmIV, Cipher.ENCRYPT_MODE, offset);
+
+        return cipher;
+    }
+
+    /**
+     * Finalize GCM cipher and write authentication tag to FileChannel.
+     * For translog blocks where tags are written inline after encrypted data.
+     *
+     * @param cipher The GCM cipher to finalize
+     * @param channel The FileChannel to write the tag
+     * @throws java.io.IOException If finalization or writing fails
+     */
+    public static void finalizeCipherAndWriteTag(Cipher cipher, java.nio.channels.FileChannel channel) throws java.io.IOException {
+        if (cipher == null) {
+            throw new IllegalArgumentException("Cipher cannot be null");
+        }
+
+        try {
+            // Finalize cipher - returns any remaining encrypted data + 16-byte tag
+            byte[] finalData = finalizeAndGetTag(cipher);
+
+            // Write to channel
+            if (finalData.length > 0) {
+                channel.write(java.nio.ByteBuffer.wrap(finalData));
+            }
+        } catch (JavaCryptoException e) {
+            throw new java.io.IOException("Failed to finalize cipher and write tag", e);
         }
     }
 

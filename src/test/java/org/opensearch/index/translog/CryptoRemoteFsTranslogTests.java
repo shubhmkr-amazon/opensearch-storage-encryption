@@ -187,7 +187,11 @@ public class CryptoRemoteFsTranslogTests extends OpenSearchTestCase {
         // Create empty translog
         String translogUUID = Translog.createEmptyTranslog(tempDir, 0L, testShardId, mockPrimaryTermSupplier.getAsLong());
 
-        // Null keyResolver causes NullPointerException when parent tries to open translog files
+        // A null keyResolver must fail CONSTRUCTION fast. CryptoChannelFactory's constructor (invoked in the
+        // CryptoRemoteFsTranslog super(...) call via createCryptoChannelFactory) rejects a null resolver with
+        // an IllegalArgumentException, which createCryptoChannelFactory wraps in an IOException. (Before the
+        // v4 lazy base-IV change this surfaced as an NPE when the constructor eagerly dereferenced the
+        // resolver; the explicit null-check now makes it a clear, deterministic fail-fast at the same point.)
         Exception exception = expectThrows(Exception.class, () -> {
             new CryptoRemoteFsTranslog(
                 mockConfig,
@@ -206,11 +210,22 @@ public class CryptoRemoteFsTranslogTests extends OpenSearchTestCase {
             );
         });
 
-        assertNotNull("Exception should be thrown for null keyResolver", exception);
-        assertTrue(
-            "Exception should be NullPointerException or contain NPE in cause chain",
-            exception instanceof NullPointerException || (exception.getCause() != null && containsNullPointerException(exception))
-        );
+        assertNotNull("Construction must fail fast for null keyResolver", exception);
+        // Accept the explicit IllegalArgumentException (current, clearer) OR a legacy NPE in the cause chain.
+        boolean keyResolverError = messageMentionsKeyResolver(exception)
+            || exception instanceof NullPointerException
+            || (exception.getCause() != null && containsNullPointerException(exception));
+        assertTrue("Exception must indicate the missing keyResolver, got: " + exception, keyResolverError);
+    }
+
+    private boolean messageMentionsKeyResolver(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            String m = c.getMessage();
+            if (m != null && m.toLowerCase().contains("keyresolver")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean containsNullPointerException(Throwable throwable) {

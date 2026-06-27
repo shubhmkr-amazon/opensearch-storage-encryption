@@ -22,18 +22,17 @@ import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.key.KeyResolver;
 
 /**
- * A FileChannel wrapper that provides transparent AES-GCM encryption/decryption
- * for translog files using 8KB authenticated chunks.
+ * A FileChannel wrapper that provides transparent AES-GCM encryption/decryption for translog files using
+ * the FRAME-AAD format.
  *
- * This implementation delegates chunking logic to TranslogChunkManager while
- * handling FileChannel lifecycle and position tracking.
+ * <p>This implementation delegates all framing/crypto to {@link TranslogFrameManager} while handling the
+ * FileChannel lifecycle and logical position tracking. The wrapper owns the concurrency contract: writes,
+ * scatter-reads, {@code force()} and {@code transferFrom()} take the write lock; positional reads and
+ * {@code transferTo()} take the read lock — so the frame manager itself holds no locks and its writer state
+ * is mutated single-threaded.
  *
- * File Format:
- * [TranslogHeader - Unencrypted]
- * [Chunk 0: ≤8KB encrypted + 16B auth tag]
- * [Chunk 1: ≤8KB encrypted + 16B auth tag]
- * ...
- * [Last Chunk: ≤8KB encrypted + 16B auth tag]
+ * <p>On-disk format (see {@link TranslogFrameManager}):
+ * [plaintext TranslogHeader][TLE1 super-header][frame...], each frame = [24B header][ciphertext][16B tag].
  *
  * @opensearch.internal
  */
@@ -41,7 +40,7 @@ import org.opensearch.index.store.key.KeyResolver;
 public class CryptoFileChannelWrapper extends FileChannel {
 
     private final FileChannel delegate;
-    private final TranslogChunkManager chunkManager;
+    private final TranslogFrameManager chunkManager;
     private final AtomicLong position;
     private final ReentrantReadWriteLock positionLock;
     private volatile boolean closed = false;
@@ -61,7 +60,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
         throws IOException {
         this.delegate = delegate;
         this.filePath = path;
-        this.chunkManager = new TranslogChunkManager(delegate, keyResolver, path, translogUUID);
+        this.chunkManager = new TranslogFrameManager(delegate, keyResolver, path, translogUUID);
         this.position = new AtomicLong(delegate.position());
         this.positionLock = new ReentrantReadWriteLock();
     }
@@ -247,7 +246,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
     public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
         ensureOpen();
         // L6: positional read of encrypted chunks — guard with the read lock so it cannot interleave with
-        // a concurrent write that is mutating the streaming-cipher state.
+        // a concurrent write that is mutating the open-block buffer/index state.
         positionLock.readLock().lock();
         try {
             return chunkManager.transferFromChunks(position, count, target);
@@ -259,8 +258,8 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
         ensureOpen();
-        // L6: mutates streaming-cipher write state (currentCipher/fileWritePosition/currentBlockNumber) —
-        // must hold the write lock, same as write().
+        // L6: mutates write state (blockBuf/fileWritePosition/currentBlockNumber) — must hold the write
+        // lock, same as write().
         positionLock.writeLock().lock();
         try {
             return chunkManager.transferToChunks(src, position, count);
@@ -295,10 +294,21 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
     @Override
     protected void implCloseChannel() throws IOException {
-        if (!closed) {
-            closed = true;
-            chunkManager.close(); // Finalize last block
-            delegate.close();
+        if (closed) {
+            return;
+        }
+        // Always close the delegate even if the final seal fails (e.g. disk-full throws inside
+        // chunkManager.close() -> flushSeal() -> writeFully). Otherwise the delegate fd leaks, and latching
+        // `closed` before the seal would make every retry a no-op (permanent leak). Mark closed only after
+        // the delegate is actually released. (Review: M2 fd-leak fix.)
+        try {
+            chunkManager.close(); // seals the open accumulator (real I/O — may throw)
+        } finally {
+            try {
+                delegate.close();
+            } finally {
+                closed = true;
+            }
         }
     }
 
@@ -309,12 +319,12 @@ public class CryptoFileChannelWrapper extends FileChannel {
     }
 
     /**
-     * Gets the TranslogChunkManager for this channel.
+     * Gets the {@link TranslogFrameManager} for this channel.
      * This allows access to finalize the cipher before upload.
      *
-     * @return the TranslogChunkManager instance
+     * @return the TranslogFrameManager instance
      */
-    public TranslogChunkManager getChunkManager() {
+    public TranslogFrameManager getChunkManager() {
         return chunkManager;
     }
 }
