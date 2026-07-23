@@ -6,6 +6,7 @@ package org.opensearch.index.store;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -60,6 +61,9 @@ public class CryptoDirectoryTests extends OpenSearchBaseDirectoryTestCase {
         rnd.nextBytes(iv);
 
         when(keyResolver.getDataKey()).thenReturn(new SecretKeySpec(rawKey, "AES"));
+        // Epoch-aware API: this test is single-epoch, so every epoch resolves to the same key.
+        when(keyResolver.getDataKey(anyInt())).thenReturn(new SecretKeySpec(rawKey, "AES"));
+        when(keyResolver.getCurrentEpoch()).thenReturn(0);
 
         Provider provider = Security.getProvider("SunJCE");
         assertNotNull("Provider should not be null", provider);

@@ -75,6 +75,8 @@ public class CryptoRemoteFsTranslogTests extends OpenSearchTestCase {
         keyResolver = mock(KeyResolver.class);
         javax.crypto.spec.SecretKeySpec mockKey = new javax.crypto.spec.SecretKeySpec(new byte[32], "AES");
         when(keyResolver.getDataKey()).thenReturn(mockKey); // 256-bit AES key
+        when(keyResolver.getDataKey(anyInt())).thenReturn(mockKey); // epoch-aware API (single-epoch tests)
+        when(keyResolver.getCurrentEpoch()).thenReturn(0);
 
         setupCommonMocks();
     }

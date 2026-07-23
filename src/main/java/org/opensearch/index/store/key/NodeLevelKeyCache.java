@@ -218,6 +218,8 @@ public class NodeLevelKeyCache {
      * @throws Exception if key loading fails
      */
     public Key get(String indexUuid, int shardId, String indexName) throws Exception {
+        Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
+        Objects.requireNonNull(indexName, "indexName cannot be null");
         KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, shardId, indexName);
         int epoch = resolver != null ? resolver.getCurrentEpoch() : 0;
         return get(indexUuid, shardId, indexName, epoch);

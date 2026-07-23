@@ -8,6 +8,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -59,6 +60,8 @@ public class HybridCryptoDirectoryTests {
         byte[] rawKey = new byte[32];
         new Random().nextBytes(rawKey);
         when(keyResolver.getDataKey()).thenReturn(new SecretKeySpec(rawKey, "AES"));
+        when(keyResolver.getDataKey(anyInt())).thenReturn(new SecretKeySpec(rawKey, "AES"));
+        when(keyResolver.getCurrentEpoch()).thenReturn(0);
 
         provider = Security.getProvider("SunJCE");
         assertNotNull("Provider should not be null", provider);

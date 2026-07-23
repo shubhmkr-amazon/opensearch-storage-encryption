@@ -9,6 +9,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -101,8 +102,10 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         when(mockIndicesAdminClient.updateSettings(any())).thenReturn(mockFuture);
         when(mockFuture.actionGet()).thenReturn(mock(AcknowledgedResponse.class));
 
-        // Setup mock resolver
+        // Setup mock resolver. The cache now loads per (shard, epoch) and routes through the
+        // epoch-aware loadKeyFromMasterKeyProvider(int); getCurrentEpoch() defaults to 0 for the mock.
         when(mockResolver.loadKeyFromMasterKeyProvider()).thenReturn(testKey1);
+        when(mockResolver.loadKeyFromMasterKeyProvider(anyInt())).thenReturn(testKey1);
     }
 
     @After
@@ -151,11 +154,13 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         Key retrievedKey = cache.get(TEST_INDEX_UUID, TEST_SHARD_ID, "test-index");
 
         assertEquals(testKey1, retrievedKey);
-        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider(anyInt());
     }
 
     public void testInitialKeyLoadFailure() throws Exception {
         when(mockResolver.loadKeyFromMasterKeyProvider())
+            .thenThrow(new RuntimeException("KMS unavailable"));
+        when(mockResolver.loadKeyFromMasterKeyProvider(anyInt()))
             .thenThrow(new RuntimeException("KMS unavailable"));
         
         Settings settings = Settings.EMPTY;
@@ -196,7 +201,7 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
 
         assertEquals(key1, key2);
         // Should only load once
-        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider(anyInt());
     }
 
     public void testExpiryWithNegativeOne() throws Exception {
@@ -204,6 +209,7 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         Settings settings = Settings.builder().put("node.store.crypto.key_expiry_interval", "-1").build();
 
         when(mockResolver.loadKeyFromMasterKeyProvider()).thenReturn(testKey1);
+        when(mockResolver.loadKeyFromMasterKeyProvider(anyInt())).thenReturn(testKey1);
 
         MasterKeyHealthMonitor.initialize(settings, mockClient, mockClusterService);
         NodeLevelKeyCache.initialize(settings, MasterKeyHealthMonitor.getInstance());
@@ -223,7 +229,7 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         assertEquals(testKey1, sameKey);
 
         // Should only load once (no reload after "expiry")
-        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider(anyInt());
     }
 
     public void testEviction() throws Exception {
@@ -246,7 +252,7 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         cache.get(TEST_INDEX_UUID, TEST_SHARD_ID, "test-index");
 
         // Should have loaded twice (once before eviction, once after)
-        verify(mockResolver, times(2)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, times(2)).loadKeyFromMasterKeyProvider(anyInt());
     }
 
     public void testSize() throws Exception {
@@ -308,11 +314,13 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
     public void testConcurrentAccess() throws Exception {
         final AtomicInteger loadCount = new AtomicInteger(0);
 
-        when(mockResolver.loadKeyFromMasterKeyProvider()).thenAnswer(invocation -> {
+        org.mockito.stubbing.Answer<Key> slowLoad = invocation -> {
             loadCount.incrementAndGet();
             Thread.sleep(100); // Simulate slow load
             return testKey1;
-        });
+        };
+        when(mockResolver.loadKeyFromMasterKeyProvider()).thenAnswer(slowLoad);
+        when(mockResolver.loadKeyFromMasterKeyProvider(anyInt())).thenAnswer(slowLoad);
 
         Settings settings = Settings.EMPTY;
         MasterKeyHealthMonitor.initialize(settings, mockClient, mockClusterService);
