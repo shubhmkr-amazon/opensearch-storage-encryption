@@ -10,8 +10,12 @@ import java.security.Provider;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import java.util.Collections;
+
 import javax.crypto.spec.SecretKeySpec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -36,6 +40,8 @@ import org.opensearch.index.store.metrics.ErrorType;
  */
 public class DefaultKeyResolver implements KeyResolver {
 
+    private static final Logger logger = LogManager.getLogger(DefaultKeyResolver.class);
+
     private final String indexUuid;
     private final String indexName;
     private final Directory directory;
@@ -43,6 +49,9 @@ public class DefaultKeyResolver implements KeyResolver {
     private final int shardId;
 
     private static final String KEY_FILE = "keyfile";
+
+    /** Suffix for the temp file used during the atomic keyfile write. */
+    private static final String TMP_SUFFIX = ".tmp";
 
     /** Current (highest) key-rotation epoch. New writes are encrypted under this epoch. */
     private volatile int currentEpoch;
@@ -132,20 +141,39 @@ public class DefaultKeyResolver implements KeyResolver {
     }
 
     /**
-     * Scans the directory for {@code keyfile.N} entries and returns the highest epoch present.
-     * Returns 0 if only the legacy {@code keyfile} exists.
+     * Scans the directory for {@code keyfile.N} entries and returns the highest epoch whose keyfile is
+     * present AND decrypts successfully.
+     *
+     * <p><b>Crash-safety:</b> a candidate is only accepted if its bytes decrypt via the key provider.
+     * This rejects a torn/partial {@code keyfile.N} left by a crash mid-rotation — advancing the current
+     * epoch to an unreadable key would make every subsequent write (and read of new segments) fail. We
+     * also skip any leftover temp file. Returns 0 if only the legacy {@code keyfile} exists.
      */
     private int discoverCurrentEpoch() throws IOException {
         int max = 0;
         for (String name : directory.listAll()) {
-            if (name.startsWith(KEY_FILE + ".")) {
+            if (name.startsWith(KEY_FILE + ".") && !name.endsWith(TMP_SUFFIX)) {
+                final int epoch;
                 try {
-                    int epoch = Integer.parseInt(name.substring(KEY_FILE.length() + 1));
-                    if (epoch > max) {
-                        max = epoch;
-                    }
+                    epoch = Integer.parseInt(name.substring(KEY_FILE.length() + 1));
                 } catch (NumberFormatException ignored) {
                     // Not an epoch keyfile (e.g. some other keyfile.* artifact); skip.
+                    continue;
+                }
+                if (epoch <= max) {
+                    continue;
+                }
+                // Verify the keyfile actually decrypts before accepting it as the current epoch.
+                try {
+                    keyProvider.decryptKey(readByteArrayFile(name));
+                    max = epoch;
+                } catch (Exception corrupt) {
+                    logger.warn(
+                        "Ignoring undecryptable/partial key file '{}' for index '{}' (likely a crash mid-rotation): {}",
+                        name,
+                        indexName,
+                        corrupt.getMessage()
+                    );
                 }
             }
         }
@@ -181,14 +209,49 @@ public class DefaultKeyResolver implements KeyResolver {
 
         DataKeyPair pair = keyProvider.generateDataPair();
         try {
-            writeByteArrayFile(keyFile, pair.getEncryptedKey());
+            writeKeyFileDurably(keyFile, pair.getEncryptedKey());
         } catch (java.nio.file.FileAlreadyExistsException raced) {
-            // A concurrent sibling won the create; its key is authoritative. Adopt and continue.
+            // A concurrent sibling won the rename; its key is authoritative. Adopt and continue.
             this.currentEpoch = nextEpoch;
             return nextEpoch;
         }
         this.currentEpoch = nextEpoch;
         return nextEpoch;
+    }
+
+    /**
+     * Writes a keyfile atomically and durably: write to a unique temp file, fsync its data, atomically
+     * rename it into place, then fsync directory metadata.
+     *
+     * <p>Crash-safety: a reader/restart never observes a half-written keyfile — it sees either the old
+     * state (no {@code keyFile}) or the complete, fsynced key. A crash before the rename leaves only a
+     * temp file, which {@link #discoverCurrentEpoch()} skips. This is what lets the current epoch be
+     * trusted after an unclean shutdown.
+     *
+     * @param keyFile the final keyfile name (e.g. {@code keyfile.3})
+     * @param data the encrypted key bytes
+     * @throws java.nio.file.FileAlreadyExistsException if a concurrent writer already produced keyFile
+     * @throws IOException on any I/O failure
+     */
+    private void writeKeyFileDurably(String keyFile, byte[] data) throws IOException {
+        // Unique temp name so concurrent siblings never collide on the temp file itself.
+        String tmp = keyFile + "." + shardId + "." + System.nanoTime() + TMP_SUFFIX;
+        boolean renamed = false;
+        try {
+            writeByteArrayFile(tmp, data);
+            directory.sync(Collections.singleton(tmp)); // fsync the temp file's data
+            directory.rename(tmp, keyFile);              // atomic publish
+            renamed = true;
+            directory.syncMetaData();                    // fsync the directory entry
+        } finally {
+            if (!renamed) {
+                try {
+                    directory.deleteFile(tmp);
+                } catch (IOException ignored) {
+                    // best-effort cleanup; a leftover temp file is skipped by discoverCurrentEpoch()
+                }
+            }
+        }
     }
 
     /** True iff the given keyfile already exists and is readable in the (shared) index directory. */

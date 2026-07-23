@@ -33,7 +33,9 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.store.action.GetIndexCountForKeyAction;
+import org.opensearch.index.store.action.RotateKeyAction;
 import org.opensearch.index.store.action.TransportGetIndexCountForKeyAction;
+import org.opensearch.index.store.action.TransportRotateKeyAction;
 import org.opensearch.index.store.block_cache.BlockCache;
 import org.opensearch.index.store.key.MasterKeyHealthMonitor;
 import org.opensearch.index.store.key.NodeLevelKeyCache;
@@ -41,6 +43,7 @@ import org.opensearch.index.store.key.ShardKeyResolverRegistry;
 import org.opensearch.index.store.metrics.CryptoMetricsService;
 import org.opensearch.index.store.pool.PoolSizeCalculator;
 import org.opensearch.index.store.rest.RestGetIndexCountForKeyAction;
+import org.opensearch.index.store.rest.RestRotateKeyAction;
 import org.opensearch.index.store.rest.RestRegisterCryptoAction;
 import org.opensearch.index.store.rest.RestUnregisterCryptoAction;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -243,7 +246,11 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
 
     @Override
     public List<ActionHandler<?, ?>> getActions() {
-        return Arrays.asList(new ActionHandler<>(GetIndexCountForKeyAction.INSTANCE, TransportGetIndexCountForKeyAction.class));
+        return Arrays
+            .asList(
+                new ActionHandler<>(GetIndexCountForKeyAction.INSTANCE, TransportGetIndexCountForKeyAction.class),
+                new ActionHandler<>(RotateKeyAction.INSTANCE, TransportRotateKeyAction.class)
+            );
     }
 
     @Override
@@ -256,7 +263,13 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return Arrays.asList(new RestRegisterCryptoAction(), new RestUnregisterCryptoAction(), new RestGetIndexCountForKeyAction());
+        return Arrays
+            .asList(
+                new RestRegisterCryptoAction(),
+                new RestUnregisterCryptoAction(),
+                new RestGetIndexCountForKeyAction(),
+                new RestRotateKeyAction()
+            );
     }
 
     @Override
