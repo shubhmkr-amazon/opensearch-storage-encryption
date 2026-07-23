@@ -160,15 +160,47 @@ public class DefaultKeyResolver implements KeyResolver {
      * under their original epoch. Re-encrypting old data to the new epoch (force-merge) and destroying
      * the old key are separate, later steps.
      *
-     * @return the newly created epoch
+     * <p><b>Idempotent across co-located shards.</b> The keyfile lives in the index-level directory
+     * shared by every shard of this index on the node, so multiple shards may rotate concurrently.
+     * If {@code keyfile.<nextEpoch>} already exists (minted by a sibling shard, or by a lost race), this
+     * method adopts it rather than failing — all shards of an index therefore converge on the SAME
+     * epoch key. (Cross-node key agreement is a separate, larger piece of work.)
+     *
+     * @return the new current epoch
      * @throws IOException if the new key cannot be generated or persisted
      */
     public synchronized int rotate() throws IOException {
         int nextEpoch = currentEpoch + 1;
+        String keyFile = keyFileForEpoch(nextEpoch);
+
+        // If a sibling shard already minted this epoch's key, adopt it (idempotent).
+        if (keyFileExists(keyFile)) {
+            this.currentEpoch = nextEpoch;
+            return nextEpoch;
+        }
+
         DataKeyPair pair = keyProvider.generateDataPair();
-        writeByteArrayFile(keyFileForEpoch(nextEpoch), pair.getEncryptedKey());
+        try {
+            writeByteArrayFile(keyFile, pair.getEncryptedKey());
+        } catch (java.nio.file.FileAlreadyExistsException raced) {
+            // A concurrent sibling won the create; its key is authoritative. Adopt and continue.
+            this.currentEpoch = nextEpoch;
+            return nextEpoch;
+        }
         this.currentEpoch = nextEpoch;
         return nextEpoch;
+    }
+
+    /** True iff the given keyfile already exists and is readable in the (shared) index directory. */
+    private boolean keyFileExists(String fileName) {
+        try (IndexInput ignored = directory.openInput(fileName, IOContext.READONCE)) {
+            return true;
+        } catch (java.nio.file.NoSuchFileException | java.io.FileNotFoundException e) {
+            return false;
+        } catch (IOException e) {
+            // Present but unreadable — treat as existing so we don't clobber a sibling's key.
+            return true;
+        }
     }
 
     /**

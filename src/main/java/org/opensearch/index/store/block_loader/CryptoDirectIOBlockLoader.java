@@ -97,10 +97,13 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
             long bytesRead = readBytes.byteSize();
 
             String normalizedPath = filePath.toAbsolutePath().normalize().toString();
-            byte[] masterKey = keyResolver.getDataKey().getEncoded();
 
-            // Get footer from disk and load metadata (footer + derived key) atomically into cache
-            EncryptionFooter footer = readFooterFromDisk(filePath, masterKey);
+            // Get footer from disk (epoch-aware: the footer's stamped epoch selects its master key).
+            EncryptionFooter footer = readFooterFromDisk(filePath);
+
+            // Resolve the master key for THIS file's epoch (NOT the current write epoch): a segment written
+            // under an older epoch must be decrypted with that epoch's key even after a rotation.
+            byte[] masterKey = keyResolver.getDataKey(footer.getKeyEpoch()).getEncoded();
 
             // Get or create metadata atomically - ensures footer and key are always consistent
             var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedPath, footer, masterKey);
@@ -173,7 +176,7 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
         }
     }
 
-    private EncryptionFooter readFooterFromDisk(Path filePath, byte[] masterKey) throws IOException {
+    private EncryptionFooter readFooterFromDisk(Path filePath) throws IOException {
         String normalizedPath = filePath.toAbsolutePath().normalize().toString();
 
         // Check cache first for fast path
@@ -200,7 +203,9 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
                 throw new IOException("Not an OSEF file -" + filePath);
             }
 
-            return EncryptionFooter.readViaFileChannel(normalizedPath, channel, masterKey, encryptionMetadataCache);
+            // Epoch-aware read: the footer's stamped epoch selects the master key for authentication.
+            return EncryptionFooter
+                .readViaFileChannel(normalizedPath, channel, epoch -> keyResolver.getDataKey(epoch).getEncoded(), encryptionMetadataCache);
         }
     }
 

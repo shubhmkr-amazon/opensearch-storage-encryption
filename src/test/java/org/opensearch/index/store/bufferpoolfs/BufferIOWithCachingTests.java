@@ -93,6 +93,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -126,6 +127,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -156,6 +158,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -189,6 +192,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -219,6 +223,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -250,6 +255,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -283,6 +289,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -314,6 +321,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -345,6 +353,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -383,6 +392,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -417,6 +427,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -442,6 +453,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -476,6 +488,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -505,6 +518,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -535,6 +549,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -563,6 +578,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,
@@ -594,6 +610,7 @@ public class BufferIOWithCachingTests extends OpenSearchTestCase {
                 tempFile,
                 baos,
                 testKey,
+                 0, // keyEpoch
                 mockPool,
                 mockCache,
                 provider,

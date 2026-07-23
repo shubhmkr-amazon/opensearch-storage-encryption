@@ -59,7 +59,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
      * @param name The name of the output
      * @param path The path to write to
      * @param os The output stream
-     * @param key The AES key (must be 32 bytes for AES-256)
+     * @param key The AES key (must be 32 bytes for AES-256) for the given epoch
+     * @param keyEpoch the key-rotation epoch this file is written under (stamped into the footer)
      * @param memorySegmentPool the pool for acquiring memory segments for caching
      * @param blockCache the cache for storing decrypted block data
      * @param provider the security provider
@@ -72,6 +73,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         Path path,
         OutputStream os,
         byte[] key,
+        int keyEpoch,
         Pool<RefCountedMemorySegment> memorySegmentPool,
         BlockCache<RefCountedMemorySegment> blockCache,
         Provider provider,
@@ -81,7 +83,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         super(
             "FSIndexOutput(path=\"" + path + "\")",
             name,
-            new EncryptedOutputStream(os, path, key, memorySegmentPool, blockCache, provider, encryptionMetadataCache),
+            new EncryptedOutputStream(os, path, key, keyEpoch, memorySegmentPool, blockCache, provider, encryptionMetadataCache),
             CHUNK_SIZE
         );
     }
@@ -90,6 +92,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
 
         private final EncryptionFooter footer;
         private final byte[] masterKey;
+        private final int keyEpoch;
         private final Key fileKey;
         private final byte[] buffer;
         private final Path path;
@@ -121,6 +124,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             OutputStream os,
             Path path,
             byte[] key,
+            int keyEpoch,
             Pool<RefCountedMemorySegment> memorySegmentPool,
             BlockCache<RefCountedMemorySegment> blockCache,
             Provider provider,
@@ -130,6 +134,7 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
             this.path = path;
             this.normalizedPath = EncryptionMetadataCache.normalizePath(path);
             this.masterKey = key;
+            this.keyEpoch = keyEpoch;
             this.buffer = new byte[BUFFER_SIZE];
             this.memorySegmentPool = memorySegmentPool;
             this.blockCache = blockCache;
@@ -141,7 +146,8 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
 
             this.algorithm = EncryptionAlgorithm.fromId((short) EncryptionMetadataTrailer.ALGORITHM_AES_256_GCM);
 
-            this.footer = EncryptionFooter.generateNew(frameSize, (short) EncryptionMetadataTrailer.ALGORITHM_AES_256_GCM);
+            // Stamp the write epoch so this file is decryptable under its own epoch after future rotations.
+            this.footer = EncryptionFooter.generateNew(frameSize, (short) EncryptionMetadataTrailer.ALGORITHM_AES_256_GCM, keyEpoch);
 
             // Derive file-specific key
             byte[] derivedKey = HkdfKeyDerivation.deriveFileKey(masterKey, footer.getMessageId());

@@ -74,7 +74,9 @@ public class BufferPoolDirectory extends FSDirectory {
     private final Worker readAheadworker;
     private final Provider provider;
     private final Path dirPath;
-    private final byte[] masterKeyBytes;
+    // Hold the live resolver, NOT a one-time key snapshot: the write epoch can advance during this
+    // directory's lifetime (rotation), and reads must resolve each file's key by its stamped epoch.
+    private final KeyResolver keyResolver;
     private final EncryptionMetadataCache encryptionMetadataCache;
 
     /**
@@ -108,7 +110,7 @@ public class BufferPoolDirectory extends FSDirectory {
         this.readAheadworker = worker;
         this.provider = provider;
         this.dirPath = getDirectory();
-        this.masterKeyBytes = keyResolver.getDataKey().getEncoded();
+        this.keyResolver = keyResolver;
         this.encryptionMetadataCache = encryptionMetadataCache;
 
         // startCacheStatsTelemetry(); // uncomment for local testing
@@ -160,11 +162,14 @@ public class BufferPoolDirectory extends FSDirectory {
             Path path = directory.resolve(name);
             OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
+            // Write under the CURRENT epoch and stamp it into the footer.
+            int writeEpoch = keyResolver.getCurrentEpoch();
             return new BufferIOWithCaching(
                 name,
                 path,
                 fos,
-                masterKeyBytes,
+                keyResolver.getDataKey(writeEpoch).getEncoded(),
+                writeEpoch,
                 this.memorySegmentPool,
                 this.blockCache,
                 this.provider,
@@ -187,11 +192,13 @@ public class BufferPoolDirectory extends FSDirectory {
         Path path = directory.resolve(name);
         OutputStream fos = Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
+        int writeEpoch = keyResolver.getCurrentEpoch();
         return new BufferIOWithCaching(
             name,
             path,
             fos,
-            masterKeyBytes,
+            keyResolver.getDataKey(writeEpoch).getEncoded(),
+            writeEpoch,
             this.memorySegmentPool,
             this.blockCache,
             this.provider,
@@ -259,9 +266,12 @@ public class BufferPoolDirectory extends FSDirectory {
             return rawFileSize - cachedFooter.getFooterLength();
         }
 
-        // Cache miss - read footer from disk (happens during file open before cache populated)
+        // Cache miss - read footer from disk (happens during file open before cache populated).
+        // Epoch-aware: the footer's stamped epoch selects the master key (segments written under an older
+        // epoch stay readable after rotation).
         try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
-            EncryptionFooter footer = EncryptionFooter.readViaFileChannel(normalizedPath, channel, masterKeyBytes, encryptionMetadataCache);
+            EncryptionFooter footer = EncryptionFooter
+                .readViaFileChannel(normalizedPath, channel, epoch -> keyResolver.getDataKey(epoch).getEncoded(), encryptionMetadataCache);
 
             // Metadata is already cached by readViaFileChannel
 
