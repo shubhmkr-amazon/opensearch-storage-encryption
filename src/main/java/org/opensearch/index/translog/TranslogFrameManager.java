@@ -67,13 +67,10 @@ public final class TranslogFrameManager {
     /** Super-header magic: 'T','L','E','1'. */
     static final byte[] MAGIC = { 'T', 'L', 'E', '1' };
     /**
-     * Current on-disk format version. This is version 1 of the versioned encrypted-translog format: the
-     * super-header carries the version byte, so versioning begins here. (The previously-deployed translog
-     * encryption had no super-header and no version byte at all; it is recognized by the absence of the
-     * {@code TLE1} magic and converted/recovered, not version-matched.) The format binds a random per-file
-     * salt into the base-IV HKDF context to keep the GCM (key, nonce) pair unique even across two physical
-     * files of the same generation (e.g. a remote-store restore that re-encrypts a generation from
-     * plaintext). Any super-header whose version byte is not {@code FORMAT_VERSION} fails closed at open.
+     * On-disk format version. Version 1 of the versioned format: the super-header carries this byte, so
+     * versioning begins here. (The previously-deployed encryption had no super-header/version byte; it is
+     * recognized by the absence of the {@code TLE1} magic, not version-matched.) A super-header whose version
+     * byte is not {@code FORMAT_VERSION} fails closed at open.
      */
     public static final byte FORMAT_VERSION = 1;
     /** Plaintext per-frame header size: u32 ptLen + u64 logicalOffset + u32 frameSeq + u32 keyEpoch + u32 crc. */
@@ -97,7 +94,11 @@ public final class TranslogFrameManager {
     private final String translogUUID;
     private final int actualHeaderSize;
     private final long generation;
-    private final int keyEpoch;
+    // Key-rotation epoch for THIS generation file. Like baseIV/fileContext/fileSalt it is finalized at
+    // super-header write time (fresh file: the resolver's current epoch) or read time (existing file: the
+    // on-disk epoch). A generation is pinned to its epoch for life, so appends after a rotation keep using
+    // the original key; only a NEW generation adopts the rotated epoch. Mirrors the per-segment store path.
+    private int keyEpoch;
     // baseIV / fileContext are LAZILY derived once the per-file salt is known: generated on the first
     // super-header write, or read from disk on the first read of an existing file. NOT set in the
     // constructor (the salt is not known yet). Funnel all access through ensureCryptoInitialized().
@@ -177,7 +178,8 @@ public final class TranslogFrameManager {
         this.translogUUID = translogUUID;
         this.actualHeaderSize = filePath.getFileName().toString().endsWith(".tlog") ? calculateTranslogHeaderSize(translogUUID) : 0;
         this.generation = parseGenerationFromFileName(filePath);
-        this.keyEpoch = 0; // epoch 0 until rotation is wired; folded into HKDF + AAD so it is future-safe
+        // keyEpoch is finalized in writeSuperHeader() (fresh file → current epoch) or
+        // verifyAndReadSuperHeader() (existing file → on-disk epoch), alongside the per-file salt.
         // NOTE: baseIV / fileContext are NOT derived here — they depend on the per-file salt, which is only
         // known once this file's super-header is written (fresh file) or read (existing file). They are set
         // by initCryptoWithSalt(...) from writeSuperHeader()/verifyAndReadSuperHeader().
@@ -192,7 +194,9 @@ public final class TranslogFrameManager {
      */
     private void initCryptoWithSalt(long salt) {
         this.fileSalt = salt;
-        byte[] dataKey = keyResolver.getDataKey().getEncoded();
+        // Derive from the master key for THIS file's epoch (set by the caller before invoking us), so a
+        // generation written under an older epoch stays decryptable after a rotation to a newer epoch.
+        byte[] dataKey = keyResolver.getDataKey(keyEpoch).getEncoded();
         this.baseIV = generation >= 0
             ? HkdfKeyDerivation.deriveTranslogBaseIV(dataKey, translogUUID, generation, keyEpoch, salt)
             : HkdfKeyDerivation.deriveTranslogBaseIV(dataKey, translogUUID); // legacy/no-gen fallback (no super-header)
@@ -285,6 +289,9 @@ public final class TranslogFrameManager {
     }
 
     private void writeSuperHeader() throws IOException {
+        // Fresh file: bind this generation to the resolver's CURRENT epoch and persist it. Must be set
+        // before initCryptoWithSalt() so the key is derived for this epoch.
+        this.keyEpoch = keyResolver.getCurrentEpoch();
         // Generate this file's random salt ONCE, then derive baseIV/fileContext from it before persisting.
         long salt = SALT_RNG.nextLong();
         initCryptoWithSalt(salt);
@@ -356,12 +363,16 @@ public final class TranslogFrameManager {
         int diskEpoch = sh.getInt();
         int diskBaseIVCheck = sh.getInt();
         long diskSalt = sh.getLong(); // per-file salt persisted at write time
+        // Adopt the ON-DISK epoch: this file was encrypted under whatever epoch was current when it was
+        // written, and it must be decrypted with THAT epoch's key even if the shard has since rotated to a
+        // newer epoch. Set keyEpoch first so initCryptoWithSalt() derives the correct per-epoch key.
+        this.keyEpoch = diskEpoch;
         // Derive baseIV/fileContext from the ON-DISK salt (the value this file was actually encrypted with),
-        // THEN validate. A wrong data key (or tampered salt) yields a different baseIV → baseIVCheck mismatch
-        // → fail closed. epoch must also match. This must run before any frameNonce()/decrypt.
+        // THEN validate. A wrong data key (wrong/absent epoch key, or tampered salt) yields a different
+        // baseIV → baseIVCheck mismatch → fail closed. This must run before any frameNonce()/decrypt.
         initCryptoWithSalt(diskSalt);
-        if (diskEpoch != keyEpoch || diskBaseIVCheck != baseIVCheck()) {
-            throw new IOException("translog key/epoch mismatch (cannot decrypt with current key) file:" + filePath);
+        if (diskBaseIVCheck != baseIVCheck()) {
+            throw new IOException("translog key/epoch mismatch (cannot decrypt with epoch " + diskEpoch + " key) file:" + filePath);
         }
         return true;
     }
@@ -482,7 +493,9 @@ public final class TranslogFrameManager {
 
         byte[] cipherWithTag;
         try {
-            Key key = keyResolver.getDataKey();
+            // Seal under this file's epoch key — the nonce/baseIV above were derived for keyEpoch, so the
+            // GCM key MUST be the same epoch or the pairing is inconsistent.
+            Key key = keyResolver.getDataKey(keyEpoch);
             cipherWithTag = AesGcmCipherFactory.encryptWithTag(key, nonce, accumBuf, ptLen, aad);
         } catch (AesGcmCipherFactory.JavaCryptoException e) {
             throw new IOException("Failed to seal translog frame " + frameSeq + " for file:" + filePath, e);
@@ -582,7 +595,10 @@ public final class TranslogFrameManager {
         FrameIndex idx = currentIndex();
         long logicalEnd = idx.scannedPlain;
         if (idx.count == 0 || dataPosition >= logicalEnd) {
-            return 0; // at/after the sealed logical EOF (anything beyond is in the open accumulator above)
+            // End-of-stream: -1, not 0, per the FileChannel.read contract. Core's recovery read loop only
+            // breaks on read < 0 and treats 0 as "retry", so returning 0 here spins it forever (hung shard)
+            // when the translog ends before the checkpoint's length. (A zero-length dst returned 0 at entry.)
+            return -1;
         }
 
         int f = findFrame(idx, dataPosition);
@@ -647,7 +663,9 @@ public final class TranslogFrameManager {
                         + ctWithTag + "B at " + (recordPos + FRAME_HEADER_SIZE) + ") file:" + filePath
                 );
             }
-            Key key = keyResolver.getDataKey();
+            // Decrypt under this file's epoch key (adopted from the on-disk super-header), matching the
+            // epoch the nonce/baseIV were derived for.
+            Key key = keyResolver.getDataKey(keyEpoch);
             byte[] nonce = frameNonce(frameSeq);
             byte[] aad = frameAad(frameHeader);
             return AesGcmCipherFactory.decryptWithTag(key, nonce, ctBuf.array(), aad);
@@ -738,21 +756,17 @@ public final class TranslogFrameManager {
             boolean valid = ptLen > 0 && ptLen <= FRAME_MAX && (int) crc.getValue() == storedCrc && recordEnd <= size
                 && frameSeq == expectedSeq && logicalOffset == plain;
             if (!valid) {
-                // An out-of-range ptLen (<=0, e.g. a flipped sign bit, or > FRAME_MAX) is never legitimate, and
-                // it makes recordEnd meaningless — a negative ptLen even computes recordEnd < size, which a bare
-                // "recordEnd >= size" tail test would misclassify as mid-stream corruption and refuse to open
-                // the shard on a benign torn trailing write. A frame cannot exceed FRAME_MAX, so we cannot
-                // locate any frame that would follow this record; there is nothing provably-valid after it, so
-                // this is the torn physical tail. Recover the intact prefix rather than fail closed.
+                // An out-of-range ptLen (<=0 from a flipped sign bit, or > FRAME_MAX) makes recordEnd
+                // meaningless: a negative ptLen yields recordEnd < size, which a bare "recordEnd >= size"
+                // test would misread as mid-stream corruption and refuse to open on a benign torn tail. No
+                // valid frame can follow it, so treat it as the torn physical tail and recover the prefix.
                 boolean ptLenOutOfRange = ptLen <= 0 || ptLen > FRAME_MAX;
                 boolean atPhysicalTail = ptLenOutOfRange || recordEnd >= size; // nothing valid can follow within the file
                 if (atPhysicalTail) {
                     break; // torn trailing record — stop, recover everything before it
                 }
                 // Strictly inside the file with an in-range ptLen: a valid frame was expected after this one,
-                // so any remaining failure (bad CRC / sequence break / logical-offset break) is real mid-stream
-                // corruption => throw, fail-closed. (Out-of-range ptLen was already handled as a torn tail
-                // above, since a garbage length makes the rest of the file unparseable.)
+                // so a remaining CRC / sequence / logical-offset failure is real mid-stream corruption => throw.
                 if ((int) crc.getValue() != storedCrc) {
                     throw new IOException("corrupt mid-stream translog frame header CRC at " + pos + " file:" + filePath);
                 }
