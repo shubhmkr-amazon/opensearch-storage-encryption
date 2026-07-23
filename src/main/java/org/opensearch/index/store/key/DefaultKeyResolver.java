@@ -198,6 +198,14 @@ public class DefaultKeyResolver implements KeyResolver {
      * @throws IOException if the new key cannot be generated or persisted
      */
     public synchronized int rotate() throws IOException {
+        // Disk is authoritative for the current epoch. After a snapshot restore, peer recovery, or shard
+        // relocation, this resolver's in-memory currentEpoch can lag the keyfiles actually present on
+        // disk (which were reconstituted by the transfer). Reconcile before advancing so we never mint a
+        // duplicate/lower epoch or clobber an existing keyfile.N.
+        int onDisk = discoverCurrentEpoch();
+        if (onDisk > currentEpoch) {
+            this.currentEpoch = onDisk;
+        }
         int nextEpoch = currentEpoch + 1;
         String keyFile = keyFileForEpoch(nextEpoch);
 
