@@ -502,14 +502,21 @@ public class EncryptionFooter {
         // Read KeyMetadataLength to know how much to skip
         int keyMetadataLengthPos = footerData.length - EncryptionMetadataTrailer.MAGIC.length - EncryptionMetadataTrailer.FOOTER_LENGTH_SIZE
             - EncryptionMetadataTrailer.ALGORITHM_ID_SIZE - EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE;
+        if (keyMetadataLengthPos < 0) {
+            throw new IOException("Malformed footer: keyMetadataLength position out of bounds");
+        }
         short keyMetadataLength = ByteBuffer
             .wrap(footerData, keyMetadataLengthPos, EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE)
             .getShort();
 
+        // Validate the untrusted, pre-auth length before using it in offset arithmetic (see extractKeyEpoch).
+        int keyMetadataPos = validateKeyMetadataSlot(keyMetadataLength, keyMetadataLengthPos);
+
         // MessageId is before KeyMetadata
-        int messageIdPos = footerData.length - EncryptionMetadataTrailer.MAGIC.length - EncryptionMetadataTrailer.FOOTER_LENGTH_SIZE
-            - EncryptionMetadataTrailer.ALGORITHM_ID_SIZE - EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE - keyMetadataLength
-            - EncryptionMetadataTrailer.MESSAGE_ID_SIZE;
+        int messageIdPos = keyMetadataPos - EncryptionMetadataTrailer.MESSAGE_ID_SIZE;
+        if (messageIdPos < 0) {
+            throw new IOException("Malformed footer: messageId position out of bounds");
+        }
 
         return Arrays.copyOfRange(footerData, messageIdPos, messageIdPos + EncryptionMetadataTrailer.MESSAGE_ID_SIZE);
     }
@@ -534,14 +541,41 @@ public class EncryptionFooter {
 
         int keyMetadataLengthPos = footerData.length - EncryptionMetadataTrailer.MAGIC.length - EncryptionMetadataTrailer.FOOTER_LENGTH_SIZE
             - EncryptionMetadataTrailer.ALGORITHM_ID_SIZE - EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE;
+        if (keyMetadataLengthPos < 0) {
+            throw new IOException("Malformed footer: keyMetadataLength position out of bounds");
+        }
         short keyMetadataLength = ByteBuffer
             .wrap(footerData, keyMetadataLengthPos, EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE)
             .getShort();
 
-        // KeyMetadata sits immediately before KeyMetadataLength.
-        int keyMetadataPos = keyMetadataLengthPos - keyMetadataLength;
+        // Validate the (attacker-controllable, pre-auth) length before using it in offset arithmetic.
+        // A negative (signed short) or oversized value must fail closed with a clean IOException rather
+        // than throw NegativeArraySize/AIOOBE deep in copyOfRange.
+        int keyMetadataPos = validateKeyMetadataSlot(keyMetadataLength, keyMetadataLengthPos);
         byte[] keyMetadata = Arrays.copyOfRange(footerData, keyMetadataPos, keyMetadataPos + keyMetadataLength);
         return decodeKeyEpoch(keyMetadata);
+    }
+
+    /**
+     * Validates a pre-auth {@code keyMetadataLength} and returns the start offset of the keyMetadata slot.
+     * The length is read as a signed short from untrusted, not-yet-authenticated footer bytes; reject
+     * negative or out-of-range values so a tampered footer fails closed with an {@link IOException}
+     * instead of an unchecked array exception.
+     *
+     * @param keyMetadataLength the raw signed length read from the footer
+     * @param keyMetadataLengthPos the offset where keyMetadataLength was read (keyMetadata ends here)
+     * @return the validated start offset of the keyMetadata slot
+     * @throws IOException if the length is negative or would run past the buffer start
+     */
+    private static int validateKeyMetadataSlot(short keyMetadataLength, int keyMetadataLengthPos) throws IOException {
+        if (keyMetadataLength < 0) {
+            throw new IOException("Malformed footer: negative keyMetadataLength " + keyMetadataLength);
+        }
+        int keyMetadataPos = keyMetadataLengthPos - keyMetadataLength;
+        if (keyMetadataPos < 0) {
+            throw new IOException("Malformed footer: keyMetadataLength " + keyMetadataLength + " exceeds footer bounds");
+        }
+        return keyMetadataPos;
     }
 
     /**

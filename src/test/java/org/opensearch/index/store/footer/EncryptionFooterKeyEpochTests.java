@@ -71,6 +71,34 @@ public class EncryptionFooterKeyEpochTests extends OpenSearchTestCase {
     }
 
     /**
+     * Adversarial: a tampered (pre-auth) keyMetadataLength must fail closed with an IOException, never
+     * an unchecked NegativeArraySize / ArrayIndexOutOfBounds from offset arithmetic.
+     */
+    public void testTamperedKeyMetadataLengthFailsClosed() throws IOException {
+        EncryptionFooter footer = EncryptionFooter.generateNew(FRAME_SIZE, ALG, 3);
+        byte[] fileKey = HkdfKeyDerivation.deriveFileKey(masterKeyForEpoch(3), footer.getMessageId());
+        byte[] serialized = footer.serialize(null, fileKey);
+
+        // keyMetadataLength sits at: end - MAGIC(4) - FOOTER_LENGTH(4) - ALGORITHM_ID(2) - KEY_METADATA_LENGTH(2)
+        int kmLenPos = serialized.length - 4 - 4 - 2 - 2;
+
+        // (a) Negative length (0x8000 = -32768 as signed short).
+        byte[] neg = serialized.clone();
+        neg[kmLenPos] = (byte) 0x80;
+        neg[kmLenPos + 1] = (byte) 0x00;
+        IOException e1 = expectThrows(IOException.class, () -> EncryptionFooter.extractKeyEpoch(neg));
+        assertTrue("negative length must be reported as malformed: " + e1.getMessage(),
+            e1.getMessage() != null && e1.getMessage().toLowerCase(java.util.Locale.ROOT).contains("keymetadata"));
+
+        // (b) Oversized length that runs past the buffer start.
+        byte[] big = serialized.clone();
+        big[kmLenPos] = (byte) 0x7F;
+        big[kmLenPos + 1] = (byte) 0xFF;
+        IOException e2 = expectThrows(IOException.class, () -> EncryptionFooter.extractKeyEpoch(big));
+        assertNotNull(e2.getMessage());
+    }
+
+    /**
      * The core dual-key property: two segments stamped with different epochs each authenticate under
      * their OWN epoch key when read through the epoch-aware resolver — even though both live in the
      * same directory at the same time.
