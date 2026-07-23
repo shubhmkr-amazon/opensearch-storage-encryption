@@ -44,37 +44,67 @@ public class EncryptionFooter {
 
     private static final Logger LOGGER = LogManager.getLogger(EncryptionFooter.class);
 
+    /** Size in bytes of the key-rotation epoch when present in the keyMetadata slot (4-byte int). */
+    public static final int KEY_EPOCH_SIZE = 4;
+
     private final byte[] messageId;
     private final List<byte[]> gcmTags;
     private final long frameSize;
     private final int frameSizePower;
     private final short algorithmId;
-    private final byte[] keyMetadata; // Currently empty - key data retrieved from keyfile
+    private final byte[] keyMetadata; // Carries the key-rotation epoch (see keyEpoch); empty for epoch 0
+    private final int keyEpoch; // Key-rotation epoch that encrypted this file; selects the master key on read
     private byte[] footerAuthTag; // 16-byte GCM auth tag for footer authentication
     private int frameCount;
     private int footerLength;
 
     public EncryptionFooter(byte[] messageId, long frameSize, short algorithmId) {
+        this(messageId, frameSize, algorithmId, 0);
+    }
+
+    /**
+     * Constructs a footer bound to a specific key-rotation epoch.
+     *
+     * <p>The epoch is stamped into the (previously reserved, length-prefixed) {@code keyMetadata}
+     * slot so that a reader can determine which master key encrypted this file BEFORE deriving the
+     * file key or verifying the footer auth tag. Epoch 0 is encoded as an empty {@code keyMetadata}
+     * so that files written before rotation existed remain byte-identical and read back as epoch 0.
+     *
+     * @param messageId  the 16-byte per-file message id
+     * @param frameSize  the frame size (power of two)
+     * @param algorithmId the algorithm id
+     * @param keyEpoch   the key-rotation epoch (>= 0)
+     */
+    public EncryptionFooter(byte[] messageId, long frameSize, short algorithmId, int keyEpoch) {
         if (messageId.length != EncryptionMetadataTrailer.MESSAGE_ID_SIZE) {
             throw new IllegalArgumentException("MessageId must be 16 bytes");
         }
         if ((frameSize & (frameSize - 1)) != 0 || frameSize <= 0) {
             throw new IllegalArgumentException("frameSize must be a power of 2");
         }
+        if (keyEpoch < 0) {
+            throw new IllegalArgumentException("keyEpoch must be non-negative");
+        }
         this.messageId = Arrays.copyOf(messageId, EncryptionMetadataTrailer.MESSAGE_ID_SIZE);
         this.gcmTags = new ArrayList<>();
         this.frameSize = frameSize;
         this.frameSizePower = Long.numberOfTrailingZeros(frameSize);
         this.algorithmId = algorithmId;
-        this.keyMetadata = new byte[0]; // Empty - currently using keyfile for key data
+        this.keyEpoch = keyEpoch;
+        // Epoch 0 -> empty keyMetadata (backward-compatible). Epoch > 0 -> 4-byte big-endian int.
+        this.keyMetadata = keyEpoch == 0 ? new byte[0] : ByteBuffer.allocate(KEY_EPOCH_SIZE).putInt(keyEpoch).array();
         this.frameCount = 0;
         this.footerLength = 0;
     }
 
     public static EncryptionFooter generateNew(long frameSize, short algorithmId) {
+        return generateNew(frameSize, algorithmId, 0);
+    }
+
+    public static EncryptionFooter generateNew(long frameSize, short algorithmId, int keyEpoch) {
         byte[] messageId = new byte[EncryptionMetadataTrailer.MESSAGE_ID_SIZE];
         new SecureRandom().nextBytes(messageId);
-        return new EncryptionFooter(messageId, frameSize, algorithmId);
+        return new EncryptionFooter(messageId, frameSize, algorithmId, keyEpoch);
     }
 
     public void setFooterLength(int footerLength) {
@@ -205,8 +235,11 @@ public class EncryptionFooter {
             throw new IOException("Footer length mismatch: expected " + expectedLength + ", got " + footerLength);
         }
 
+        // Decode the key-rotation epoch from keyMetadata. Empty (legacy files) => epoch 0.
+        int keyEpoch = decodeKeyEpoch(keyMetadata);
+
         // Create footer and read GCM tags
-        EncryptionFooter footer = new EncryptionFooter(messageId, frameSize, algorithmId);
+        EncryptionFooter footer = new EncryptionFooter(messageId, frameSize, algorithmId, keyEpoch);
         footer.frameCount = frameCount;
         footer.footerAuthTag = authTag;
         footer.setFooterLength(footerLength);
@@ -244,6 +277,34 @@ public class EncryptionFooter {
 
     public byte[] getMessageId() {
         return Arrays.copyOf(messageId, EncryptionMetadataTrailer.MESSAGE_ID_SIZE);
+    }
+
+    /**
+     * Returns the key-rotation epoch that encrypted this file. Files written before key rotation
+     * existed carry an empty keyMetadata slot and therefore report epoch 0.
+     *
+     * @return the key-rotation epoch (>= 0)
+     */
+    public int getKeyEpoch() {
+        return keyEpoch;
+    }
+
+    /**
+     * Decodes the key-rotation epoch from the keyMetadata slot.
+     * An empty slot (legacy files, or epoch 0) decodes to 0.
+     *
+     * @param keyMetadata the raw keyMetadata bytes from the footer
+     * @return the decoded epoch
+     * @throws IOException if the slot is present but not the expected size
+     */
+    private static int decodeKeyEpoch(byte[] keyMetadata) throws IOException {
+        if (keyMetadata == null || keyMetadata.length == 0) {
+            return 0;
+        }
+        if (keyMetadata.length != KEY_EPOCH_SIZE) {
+            throw new IOException("Unexpected keyMetadata length for epoch: " + keyMetadata.length);
+        }
+        return ByteBuffer.wrap(keyMetadata).getInt();
     }
 
     public void addGcmTag(byte[] tag) throws IOException {
@@ -331,6 +392,28 @@ public class EncryptionFooter {
         byte[] masterKey,
         EncryptionMetadataCache encryptionMetadataCache
     ) throws IOException {
+        // Legacy/single-epoch path: the supplied master key is used regardless of the stamped epoch.
+        return readViaFileChannel(normalizedFilePath, channel, epoch -> masterKey, encryptionMetadataCache);
+    }
+
+    /**
+     * Epoch-aware footer read. Extracts the key-rotation epoch from the footer WITHOUT authentication,
+     * asks the supplied resolver for that epoch's master key, then derives the file key and verifies
+     * the footer. This is what lets segments written under an older epoch stay readable after rotation.
+     *
+     * @param normalizedFilePath normalized file path string
+     * @param channel FileChannel to read from
+     * @param masterKeyForEpoch resolves an epoch to its 32-byte master key
+     * @param encryptionMetadataCache cache for encryption metadata
+     * @return the deserialized (and authenticated) footer
+     * @throws IOException if reading, key resolution, or authentication fails
+     */
+    public static EncryptionFooter readViaFileChannel(
+        String normalizedFilePath,
+        java.nio.channels.FileChannel channel,
+        java.util.function.IntFunction<byte[]> masterKeyForEpoch,
+        EncryptionMetadataCache encryptionMetadataCache
+    ) throws IOException {
 
         EncryptionFooter cachedFooter = encryptionMetadataCache.getFooter(normalizedFilePath);
         if (cachedFooter != null) {
@@ -383,6 +466,13 @@ public class EncryptionFooter {
         int footerStart = bufferArray.length - footerLength;
         byte[] footerBytes = Arrays.copyOfRange(bufferArray, footerStart, bufferArray.length);
 
+        // Extract the epoch (pre-auth) and resolve the master key that encrypted this file.
+        int keyEpoch = extractKeyEpoch(footerBytes);
+        byte[] masterKey = masterKeyForEpoch.apply(keyEpoch);
+        if (masterKey == null) {
+            throw new IOException("No master key available for epoch " + keyEpoch + " (file: " + normalizedFilePath + ")");
+        }
+
         // Extract messageId to derive file key for authentication
         byte[] messageId = extractMessageId(footerBytes);
         byte[] fileKey = HkdfKeyDerivation.deriveFileKey(masterKey, messageId);
@@ -422,6 +512,36 @@ public class EncryptionFooter {
             - EncryptionMetadataTrailer.MESSAGE_ID_SIZE;
 
         return Arrays.copyOfRange(footerData, messageIdPos, messageIdPos + EncryptionMetadataTrailer.MESSAGE_ID_SIZE);
+    }
+
+    /**
+     * Extract the key-rotation epoch from footer bytes WITHOUT full deserialization or authentication.
+     *
+     * <p>This mirrors {@link #extractMessageId(byte[])}: the reader must know which master key
+     * (epoch) encrypted the file before it can derive the file key and verify the footer auth tag.
+     * The epoch lives in the length-prefixed keyMetadata slot; an empty slot means epoch 0 (legacy).
+     *
+     * @param footerBytes complete footer bytes including auth tag
+     * @return the key-rotation epoch (>= 0)
+     * @throws IOException if the footer format is invalid
+     */
+    public static int extractKeyEpoch(byte[] footerBytes) throws IOException {
+        if (footerBytes.length < EncryptionMetadataTrailer.MIN_FOOTER_SIZE) {
+            throw new IOException("Footer too small: " + footerBytes.length);
+        }
+
+        byte[] footerData = Arrays.copyOfRange(footerBytes, EncryptionMetadataTrailer.FOOTER_AUTH_TAG_SIZE, footerBytes.length);
+
+        int keyMetadataLengthPos = footerData.length - EncryptionMetadataTrailer.MAGIC.length - EncryptionMetadataTrailer.FOOTER_LENGTH_SIZE
+            - EncryptionMetadataTrailer.ALGORITHM_ID_SIZE - EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE;
+        short keyMetadataLength = ByteBuffer
+            .wrap(footerData, keyMetadataLengthPos, EncryptionMetadataTrailer.KEY_METADATA_LENGTH_SIZE)
+            .getShort();
+
+        // KeyMetadata sits immediately before KeyMetadataLength.
+        int keyMetadataPos = keyMetadataLengthPos - keyMetadataLength;
+        byte[] keyMetadata = Arrays.copyOfRange(footerData, keyMetadataPos, keyMetadataPos + keyMetadataLength);
+        return decodeKeyEpoch(keyMetadata);
     }
 
     /**

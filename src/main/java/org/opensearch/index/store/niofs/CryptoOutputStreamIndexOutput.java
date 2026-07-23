@@ -99,9 +99,12 @@ public final class CryptoOutputStreamIndexOutput extends OutputStreamIndexOutput
             this.frameSizePower = EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE_POWER;
             this.frameSizeMask = (1L << frameSizePower) - 1;
 
-            // Generate MessageId and derive file-specific key
-            this.footer = EncryptionFooter.generateNew(1L << frameSizePower, (short) algorithmId);
-            this.masterKey = keyResolver.getDataKey().getEncoded();
+            // Generate MessageId and derive file-specific key. Stamp the current key-rotation epoch
+            // into the footer and encrypt this new segment under that epoch's master key, so that a
+            // reader can later select the right key even after further rotations.
+            int writeEpoch = keyResolver.getCurrentEpoch();
+            this.footer = EncryptionFooter.generateNew(1L << frameSizePower, (short) algorithmId, writeEpoch);
+            this.masterKey = keyResolver.getDataKey(writeEpoch).getEncoded();
             byte[] derivedKey = HkdfKeyDerivation.deriveFileKey(masterKey, footer.getMessageId());
             this.fileKey = new javax.crypto.spec.SecretKeySpec(derivedKey, "AES");
 

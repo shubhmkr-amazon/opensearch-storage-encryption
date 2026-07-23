@@ -178,7 +178,12 @@ public class CryptoNIOFSDirectory extends NIOFSDirectory {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             try {
                 EncryptionFooter footer = EncryptionFooter
-                    .readViaFileChannel(normalizedPath, channel, keyResolver.getDataKey().getEncoded(), encryptionMetadataCache);
+                    .readViaFileChannel(
+                        normalizedPath,
+                        channel,
+                        epoch -> keyResolver.getDataKey(epoch).getEncoded(),
+                        encryptionMetadataCache
+                    );
                 return fileSize - footer.getFooterLength();
             } catch (EncryptionFooter.NotOSEFFileException e) {
                 return fileSize;

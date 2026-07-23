@@ -77,11 +77,13 @@ final class CryptoBufferedIndexInput extends BufferedIndexInput {
         this.normalizedFilePath = EncryptionMetadataCache.normalizePath(filePath);
         this.encryptionMetadataCache = encryptionMetadataCache;
 
-        // Get master key first
-        this.masterKey = keyResolver.getDataKey().getEncoded();
+        // Read footer using an epoch-aware resolver: the footer's stamped epoch selects which master
+        // key decrypts this file, so segments written under an older epoch stay readable after rotation.
+        EncryptionFooter footer = EncryptionFooter
+            .readViaFileChannel(normalizedFilePath, channel, epoch -> keyResolver.getDataKey(epoch).getEncoded(), encryptionMetadataCache);
 
-        // Read footer and cache metadata atomically
-        EncryptionFooter footer = EncryptionFooter.readViaFileChannel(normalizedFilePath, channel, masterKey, encryptionMetadataCache);
+        // Resolve the master key for THIS file's epoch (used for frame IV derivation below).
+        this.masterKey = keyResolver.getDataKey(footer.getKeyEpoch()).getEncoded();
 
         // Get metadata (already cached by readViaFileChannel)
         var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedFilePath, footer, masterKey);

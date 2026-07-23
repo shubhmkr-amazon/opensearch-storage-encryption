@@ -41,9 +41,47 @@ public class NodeLevelKeyCache {
 
     private static NodeLevelKeyCache INSTANCE;
 
-    private final LoadingCache<ShardCacheKey, Key> keyCache;
+    private final LoadingCache<EpochCacheKey, Key> keyCache;
     private final long keyExpiryDuration;
     private final MasterKeyHealthMonitor healthMonitor;
+
+    /**
+     * Cache key that extends the shard identity with a key-rotation epoch.
+     *
+     * <p>{@link ShardCacheKey} is intentionally shared across per-shard registries and must not gain an
+     * epoch dimension. Key material, however, is cached per (shard, epoch) so that both the old and new
+     * epoch keys can be resident simultaneously during an online rotation.
+     */
+    private static final class EpochCacheKey {
+        private final ShardCacheKey shardKey;
+        private final int epoch;
+
+        EpochCacheKey(ShardCacheKey shardKey, int epoch) {
+            this.shardKey = shardKey;
+            this.epoch = epoch;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof EpochCacheKey other)) {
+                return false;
+            }
+            return epoch == other.epoch && shardKey.equals(other.shardKey);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * shardKey.hashCode() + epoch;
+        }
+
+        @Override
+        public String toString() {
+            return shardKey.toString() + "-epoch-" + epoch;
+        }
+    }
 
     /**
      * Initializes the singleton instance with node-level settings and health monitor.
@@ -106,9 +144,9 @@ public class NodeLevelKeyCache {
         }
         // If keyExpiryDuration <= 0, cache never expires
 
-        this.keyCache = builder.build(new CacheLoader<ShardCacheKey, Key>() {
+        this.keyCache = builder.build(new CacheLoader<EpochCacheKey, Key>() {
             @Override
-            public Key load(ShardCacheKey key) throws Exception {
+            public Key load(EpochCacheKey key) throws Exception {
                 return loadKey(key);
             }
         });
@@ -122,18 +160,18 @@ public class NodeLevelKeyCache {
      * @return the loaded encryption key
      * @throws Exception if key loading fails
      */
-    private Key loadKey(ShardCacheKey key) throws Exception {
-        String indexUuid = key.getIndexUuid();
-        String indexName = key.getIndexName();
+    private Key loadKey(EpochCacheKey key) throws Exception {
+        String indexUuid = key.shardKey.getIndexUuid();
+        String indexName = key.shardKey.getIndexName();
 
         // Get resolver from registry
-        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, key.getShardId(), indexName);
+        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, key.shardKey.getShardId(), indexName);
         if (resolver == null) {
             throw new IllegalStateException("No resolver registered for shard: " + key);
         }
 
         try {
-            Key loadedKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
+            Key loadedKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider(key.epoch);
 
             // Success: Report to health monitor
             healthMonitor.reportSuccess(indexUuid, indexName);
@@ -168,12 +206,29 @@ public class NodeLevelKeyCache {
      * @return the encryption key
      * @throws Exception if key loading fails
      */
+    /**
+     * Convenience overload that resolves the shard's current (write) epoch via its registered
+     * resolver, then returns that epoch's key. Used by callers that are epoch-agnostic (e.g. the
+     * health monitor warming the active key).
+     *
+     * @param indexUuid the index UUID
+     * @param shardId   the shard ID
+     * @param indexName the index name
+     * @return the encryption key for the current epoch
+     * @throws Exception if key loading fails
+     */
     public Key get(String indexUuid, int shardId, String indexName) throws Exception {
+        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, shardId, indexName);
+        int epoch = resolver != null ? resolver.getCurrentEpoch() : 0;
+        return get(indexUuid, shardId, indexName, epoch);
+    }
+
+    public Key get(String indexUuid, int shardId, String indexName, int epoch) throws Exception {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         Objects.requireNonNull(indexName, "indexName cannot be null");
 
         try {
-            return keyCache.get(new ShardCacheKey(indexUuid, shardId, indexName));
+            return keyCache.get(new EpochCacheKey(new ShardCacheKey(indexUuid, shardId, indexName), epoch));
         } catch (CompletionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof Exception) {
@@ -195,7 +250,9 @@ public class NodeLevelKeyCache {
     public void evict(String indexUuid, int shardId, String indexName) {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         Objects.requireNonNull(indexName, "indexName cannot be null");
-        keyCache.invalidate(new ShardCacheKey(indexUuid, shardId, indexName));
+        // Evict every epoch cached for this shard (shard close should drop all key material).
+        ShardCacheKey shardKey = new ShardCacheKey(indexUuid, shardId, indexName);
+        keyCache.asMap().keySet().removeIf(k -> k.shardKey.equals(shardKey));
     }
 
     /**
@@ -211,9 +268,9 @@ public class NodeLevelKeyCache {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         Objects.requireNonNull(indexName, "indexName cannot be null");
 
-        ShardCacheKey key = new ShardCacheKey(indexUuid, shardId, indexName);
-        // getIfPresent returns null if key is absent or expired
-        return keyCache.getIfPresent(key) != null;
+        // Present if any epoch for this shard is currently cached.
+        ShardCacheKey shardKey = new ShardCacheKey(indexUuid, shardId, indexName);
+        return keyCache.asMap().keySet().stream().anyMatch(k -> k.shardKey.equals(shardKey));
     }
 
     /**
@@ -234,23 +291,31 @@ public class NodeLevelKeyCache {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         Objects.requireNonNull(indexName, "indexName cannot be null");
 
-        ShardCacheKey cacheKey = new ShardCacheKey(indexUuid, shardId, indexName);
+        ShardCacheKey shardKey = new ShardCacheKey(indexUuid, shardId, indexName);
 
-        // Only refresh if key exists in cache
-        if (keyCache.getIfPresent(cacheKey) == null) {
+        // Snapshot the epochs currently cached for this shard; refresh each so that all live epochs
+        // (old + new during a rotation) stay warm.
+        java.util.List<EpochCacheKey> cachedEpochs = keyCache
+            .asMap()
+            .keySet()
+            .stream()
+            .filter(k -> k.shardKey.equals(shardKey))
+            .collect(java.util.stream.Collectors.toList());
+
+        if (cachedEpochs.isEmpty()) {
             return false;
         }
 
-        // Get resolver and load new key
+        // Get resolver and reload each cached epoch's key
         KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, shardId, indexName);
         if (resolver == null) {
             return false;
         }
 
-        Key newKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
-
-        // Update cache with new key
-        keyCache.put(cacheKey, newKey);
+        for (EpochCacheKey cacheKey : cachedEpochs) {
+            Key newKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider(cacheKey.epoch);
+            keyCache.put(cacheKey, newKey);
+        }
 
         healthMonitor.reportSuccess(indexUuid, indexName);
         return true;

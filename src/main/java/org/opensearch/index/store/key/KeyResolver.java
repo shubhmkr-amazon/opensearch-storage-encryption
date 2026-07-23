@@ -21,9 +21,28 @@ import java.security.Key;
 public interface KeyResolver {
 
     /**
-     * Returns the symmetric encryption key used for cipher operations.
+     * Returns the symmetric encryption key for the current (write) key-rotation epoch.
      *
      * @return the decrypted symmetric {@link Key}, typically AES
      */
     Key getDataKey();
+
+    /**
+     * Returns the symmetric encryption key for a specific key-rotation epoch.
+     *
+     * <p>Reads resolve the epoch from a segment's footer and ask for exactly that epoch's key, so
+     * that segments written under an older epoch stay decryptable after rotation (online dual-key
+     * reads). Epoch 0 is the pre-rotation key.
+     *
+     * @param epoch the key-rotation epoch (>= 0)
+     * @return the decrypted symmetric {@link Key} for that epoch
+     */
+    Key getDataKey(int epoch);
+
+    /**
+     * Returns the current (highest) key-rotation epoch. New writes are encrypted under this epoch.
+     *
+     * @return the current epoch (>= 0)
+     */
+    int getCurrentEpoch();
 }
