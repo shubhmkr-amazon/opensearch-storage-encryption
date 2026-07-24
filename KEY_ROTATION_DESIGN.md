@@ -64,6 +64,64 @@ existing data; convergence to the new epoch happens as merges/force-merge rewrit
 - **Compromise recovery**: steps 1–4 with a **forced** merge, urgently, because the leaked key opens old
   segments (and any snapshot/backup copies) until they are gone.
 
+### 4a. Key transition in action (concrete walkthrough)
+
+A single-shard trace showing the on-disk state, footer epochs, and API calls at each step. `keyfile` is
+the epoch-0 key; `keyfile.N` is epoch N. Segment `_X.cfs[eE]` means segment `_X` stamped with epoch E.
+
+```
+STEP 0 — steady state (epoch 0, pre-rotation)
+  index dir : keyfile
+  segments  : _0.cfs[e0] _1.cfs[e0]
+  resolver  : currentEpoch=0
+  reads     : getDataKey(0)  writes -> stamp e0, encrypt with key0
+
+STEP 1 — operator triggers rotation
+  POST /_plugins/_opensearch_storage_encryption/my-index/_rotate_key
+    └─ TransportRotateKeyAction fans out to each node hosting a primary of my-index
+       └─ DefaultKeyResolver.rotate():
+            reconcile currentEpoch from disk (still 0)
+            mint keyfile.1  (provider.generateDataPair())
+            writeKeyFileDurably: keyfile.1.<shard>.<nanos>.tmp -> sync -> rename keyfile.1 -> syncMetaData
+            currentEpoch = 1
+    response: { rotated_shards: [ { index: my-index, shard: 0, new_epoch: 1 } ], _shards: {successful:1} }
+
+  index dir : keyfile  keyfile.1
+  segments  : _0.cfs[e0] _1.cfs[e0]         <-- data UNCHANGED, still epoch 0
+  resolver  : currentEpoch=1
+
+STEP 2 — writes cut over (no data movement)
+  new doc -> flush -> _2.cfs[e1]            <-- new segment stamped epoch 1, encrypted with key1
+  index dir : keyfile  keyfile.1
+  segments  : _0.cfs[e0] _1.cfs[e0] _2.cfs[e1]
+
+  READ PATH (online dual-key): open _0 -> footer says e0 -> getDataKey(0)=key0 -> decrypt OK
+                               open _2 -> footer says e1 -> getDataKey(1)=key1 -> decrypt OK
+  (both epochs served simultaneously; a search spanning all segments works)
+
+STEP 3 — backfill: force-merge (or let natural merges do it)
+  POST /my-index/_forcemerge?max_num_segments=1
+  Lucene reads _0[e0],_1[e0],_2[e1] (each under ITS epoch key) and writes ONE new segment
+  under the CURRENT epoch:
+  segments  : _3.cfs[e1]                    <-- everything now epoch 1; old segment files deleted
+
+STEP 4 — retire old key  (NOT yet implemented — gate §10.2)
+  verify no segment/translog generation is stamped e0  (scan footers via extractKeyEpoch)
+  delete keyfile ; evict + zeroize key0 from NodeLevelKeyCache
+  index dir : keyfile.1
+  segments  : _3.cfs[e1]
+  -> the leaked epoch-0 key can no longer decrypt anything live. (Snapshots/backups holding _0[e0]
+     remain readable by key0 until they are also purged — see §10.1/§4 immutability note.)
+```
+
+Notes:
+- Steps 1–2 are **instant and data-free** (metadata only). Step 3 is the expensive rewrite. Step 4 is the
+  only step that actually *contains* a compromise, and it depends on step 3 completing.
+- Translog transitions the same way per generation: after rotation, the next generation roll writes a
+  super-header stamped epoch 1; existing generations keep their epoch and stay decryptable.
+- Cross-node: after STEP 1, if shard 0 relocates or a replica recovers, `keyfile.1` travels inside the
+  shard directory, so the target node resolves epoch 1 correctly (verified, §7).
+
 ### Cost
 - Space: +4 bytes/segment footer once rotated (0 at epoch 0); N resident master keys; negligible.
 - Speed: one extra pre-auth epoch read + per-epoch cache lookup on file open; **zero** for never-rotated
