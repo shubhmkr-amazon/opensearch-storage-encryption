@@ -122,6 +122,64 @@ Notes:
 - Cross-node: after STEP 1, if shard 0 relocates or a replica recovers, `keyfile.1` travels inside the
   shard directory, so the target node resolves epoch 1 correctly (verified, §7).
 
+### 4b. The cutover instant, and "in transit" behaviour (begin → end)
+
+This is the precise moment writes switch epochs, and what happens to operations already in flight when
+`rotate()` fires. It matters because ingest and search never pause during a rotation.
+
+**Where the epoch is bound (the cutover granularity is PER SEGMENT FILE).**
+`rotate()` flips `currentEpoch` atomically *after* the new `keyfile.N` is fsynced and renamed into place
+(`DefaultKeyResolver.writeKeyFileDurably` → `rename` → then `currentEpoch = N`). A writer binds its epoch
+**once, when the segment file is created**:
+```
+CryptoOutputStreamIndexOutput ctor:
+    int writeEpoch = keyResolver.getCurrentEpoch();   // captured ONCE, at file open
+    footer = generateNew(..., writeEpoch);            // whole file stamped this epoch
+    masterKey = keyResolver.getDataKey(writeEpoch);   // whole file encrypted with this epoch's key
+```
+So a segment file is **atomic w.r.t. epoch**: it is entirely epoch E or entirely epoch E+1, never a mix.
+There is no mid-file key switch. The cutover boundary is "the next `createOutput` after the flip", not
+"the next byte".
+
+**Timeline of a rotation with concurrent ingest + search:**
+```
+ t0   ingest writing _2 (opened at e0) ......................  search reading _0[e0], _1[e0]
+ t1   rotate() begins: mint+fsync+rename keyfile.1
+ t2   rotate() sets currentEpoch = 1   <-- THE CUTOVER INSTANT (atomic, single volatile write)
+ t3   _2 finishes flushing .............. still e0 (bound at t0, before the flip) -> _2.cfs[e0]
+ t4   next flush opens _3 -> getCurrentEpoch()=1 -> _3.cfs[e1]
+ --------------------------------------------------------------------------------------------
+ throughout: search opens each segment, reads its footer epoch, calls getDataKey(thatEpoch).
+ A query at t2.5 spanning _0,_1,_2 (all e0) + _3 (e1) decrypts each under its own key. No stall.
+```
+
+**In-flight operations at the cutover instant:**
+| In flight when `currentEpoch` flips | Outcome |
+|---|---|
+| A segment already open for write (`_2`) | Keeps its captured epoch (e0); finishes as `_2.cfs[e0]`. Correct — its bytes were encrypted with key0. |
+| A flush that *starts* after the flip (`_3`) | Binds e1; `_3.cfs[e1]`. |
+| A search reading any segment | Unaffected — key is chosen per-file from the footer, both keys resident in `NodeLevelKeyCache`. |
+| An open translog generation | Keeps its super-header epoch; only the *next* generation roll picks up e1. |
+| A merge in progress | Reads inputs under their epochs, writes output under `getCurrentEpoch()` at the time the output segment is created. |
+
+**Ordering guarantee that makes cutover safe:** `keyfile.N` is durably on disk (fsync + rename) *before*
+`currentEpoch` advances. So the instant any writer can observe epoch N, the key for N is already readable —
+there is no window where a segment is stamped an epoch whose keyfile isn't yet persisted. If the node
+crashes between rename and the volatile set, `discoverCurrentEpoch()` re-derives the true epoch from disk
+on restart (only accepting a keyfile.N that decrypts).
+
+**"In transit" = the coexistence window (t2 → end of step 3).** Between the cutover and force-merge
+completion, the shard legitimately holds **both** epochs on disk and serves both. This window can last
+indefinitely for proactive rotation (natural merges drain e0 lazily) or is deliberately compressed for
+compromise recovery (forced merge). During it:
+- Reads: per-segment key selection (dual-key). No downtime.
+- Writes: all e1.
+- Old key (key0) remains **required** until the last e0 segment is merged away — which is why "the leak is
+  not contained" until step 4, and why compromise recovery must *force* the merge rather than wait.
+
+**End state.** After force-merge, every live segment/generation is e1 and `getDataKey(0)` is no longer
+invoked by any read; step 4 (retirement) can then delete `keyfile` and zeroize key0.
+
 ### Cost
 - Space: +4 bytes/segment footer once rotated (0 at epoch 0); N resident master keys; negligible.
 - Speed: one extra pre-auth epoch read + per-epoch cache lookup on file open; **zero** for never-rotated
